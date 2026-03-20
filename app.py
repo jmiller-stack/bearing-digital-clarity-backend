@@ -345,6 +345,32 @@ def init_db() -> None:
             );
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS note_analytics (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              note_id INTEGER,
+              purged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              note_format TEXT,
+              note_template_name TEXT,
+              session_type TEXT,
+              duration_minutes INTEGER,
+              treatment_modality TEXT,
+              diagnosis_count INTEGER,
+              section_count INTEGER,
+              generation_time_ms INTEGER,
+              ai_output_char_count INTEGER,
+              final_output_char_count INTEGER,
+              was_edited INTEGER DEFAULT 0,
+              edited_section_count INTEGER DEFAULT 0,
+              was_copied INTEGER DEFAULT 0,
+              feedback_rating TEXT,
+              risk_level TEXT,
+              field_fill_json TEXT,
+              interventions_count INTEGER
+            );
+            """
+        )
         seed_builtin_templates(connection)
         connection.commit()
 
@@ -1145,11 +1171,105 @@ def mark_note_copied(
     return {"note_id": note_id, "copied": True}
 
 
+# ---------------------------------------------------------------------------
+# Analytics helpers — no PHI stored
+# ---------------------------------------------------------------------------
+
+ANALYTICS_TRACKED_FIELDS = [
+    "treatment_goals",
+    "interventions_description",
+    "additional_observations",
+    "client_response",
+    "progress",
+    "risk_level",
+    "risk_details",
+    "plan_next_session",
+    "homework",
+    "next_appointment",
+    "client_report",
+    "affect",
+    "engagement",
+    "appearance",
+    "speech",
+    "thought_process",
+]
+
+
+def _extract_analytics_row(row: sqlite3.Row, input_payload: dict[str, Any]) -> dict[str, Any]:
+    """Return an anonymized analytics dict suitable for inserting into note_analytics."""
+    field_fill = {
+        field: 1 if input_payload.get(field) else 0
+        for field in ANALYTICS_TRACKED_FIELDS
+    }
+    edits = parse_json_field(decrypt_field(row["edits"]), default={})
+    final_output = decrypt_field(row["final_output"])
+    ai_output_raw = decrypt_field(row["ai_output"])
+    diagnoses = normalize_diagnoses(input_payload.get("primary_diagnosis"))
+    interventions_checked = input_payload.get("interventions_checked") or []
+    section_config = resolve_section_config(row["note_format"], row["section_config_json"])
+    return {
+        "note_id": row["id"],
+        "note_format": row["note_format"],
+        "note_template_name": row["note_template_name"],
+        "session_type": row["session_type"],
+        "duration_minutes": row["duration_minutes"],
+        "treatment_modality": row["treatment_modality"],
+        "diagnosis_count": len(diagnoses),
+        "section_count": len(section_config),
+        "generation_time_ms": row["generation_time_ms"],
+        "ai_output_char_count": len(ai_output_raw) if ai_output_raw else 0,
+        "final_output_char_count": len(final_output) if final_output else 0,
+        "was_edited": 1 if edits else 0,
+        "edited_section_count": len(edits) if isinstance(edits, dict) else 0,
+        "was_copied": 1 if row["copied_at"] else 0,
+        "feedback_rating": row["feedback_rating"],
+        "risk_level": input_payload.get("risk_level"),
+        "field_fill_json": json.dumps(field_fill),
+        "interventions_count": len(interventions_checked),
+    }
+
+
 @app.delete("/api/notes/{note_id}/purge")
 def purge_note_session(note_id: int, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
     user_id = require_user_id(x_user_id)
     with get_connection() as connection:
-        fetch_note_for_user(connection, note_id, user_id)
+        row = fetch_note_for_user(connection, note_id, user_id)
+        # Capture anonymized analytics before wiping PHI
+        input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
+        if isinstance(input_payload, dict) and input_payload:
+            analytics = _extract_analytics_row(row, input_payload)
+            connection.execute(
+                """
+                INSERT INTO note_analytics (
+                    note_id, note_format, note_template_name, session_type,
+                    duration_minutes, treatment_modality, diagnosis_count,
+                    section_count, generation_time_ms, ai_output_char_count,
+                    final_output_char_count, was_edited, edited_section_count,
+                    was_copied, feedback_rating, risk_level, field_fill_json,
+                    interventions_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    analytics["note_id"],
+                    analytics["note_format"],
+                    analytics["note_template_name"],
+                    analytics["session_type"],
+                    analytics["duration_minutes"],
+                    analytics["treatment_modality"],
+                    analytics["diagnosis_count"],
+                    analytics["section_count"],
+                    analytics["generation_time_ms"],
+                    analytics["ai_output_char_count"],
+                    analytics["final_output_char_count"],
+                    analytics["was_edited"],
+                    analytics["edited_section_count"],
+                    analytics["was_copied"],
+                    analytics["feedback_rating"],
+                    analytics["risk_level"],
+                    analytics["field_fill_json"],
+                    analytics["interventions_count"],
+                ),
+            )
         connection.execute(
             """
             UPDATE note_generations
@@ -1264,4 +1384,100 @@ def get_note(note_id: int, x_user_id: str | None = Header(default=None)) -> dict
             "feedback_notes": decrypt_field(row["feedback_notes"]),
         },
         "final_output": final_output or build_plaintext_output(metadata, sections),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analytics summary — no auth required, no PHI returned
+# ---------------------------------------------------------------------------
+
+@app.get("/api/analytics/summary")
+def get_analytics_summary() -> dict[str, Any]:
+    """Aggregate anonymized stats from note_analytics. No PHI. No auth required."""
+    with get_connection() as connection:
+        total = connection.execute("SELECT COUNT(*) FROM note_analytics").fetchone()[0]
+
+        by_format = {
+            (row[0] or "unknown"): row[1]
+            for row in connection.execute(
+                "SELECT note_format, COUNT(*) FROM note_analytics GROUP BY note_format"
+            ).fetchall()
+        }
+        by_template = {
+            (row[0] or "standard"): row[1]
+            for row in connection.execute(
+                "SELECT note_template_name, COUNT(*) FROM note_analytics GROUP BY note_template_name"
+            ).fetchall()
+        }
+
+        avgs = connection.execute(
+            """
+            SELECT
+                AVG(generation_time_ms),
+                AVG(ai_output_char_count),
+                AVG(final_output_char_count),
+                AVG(was_copied) * 100.0,
+                AVG(was_edited) * 100.0,
+                AVG(edited_section_count),
+                AVG(diagnosis_count),
+                AVG(interventions_count)
+            FROM note_analytics
+            """
+        ).fetchone()
+
+        def top3(col: str) -> list[dict[str, Any]]:
+            rows = connection.execute(
+                f"SELECT {col}, COUNT(*) as n FROM note_analytics "
+                f"WHERE {col} IS NOT NULL GROUP BY {col} ORDER BY n DESC LIMIT 3"
+            ).fetchall()
+            return [{"value": r[0], "count": r[1]} for r in rows]
+
+        risk_dist = {
+            (row[0] or "not_specified"): row[1]
+            for row in connection.execute(
+                "SELECT risk_level, COUNT(*) FROM note_analytics GROUP BY risk_level"
+            ).fetchall()
+        }
+
+        fill_rows = connection.execute(
+            "SELECT field_fill_json FROM note_analytics WHERE field_fill_json IS NOT NULL"
+        ).fetchall()
+        field_fill_rates: dict[str, float] = {}
+        if fill_rows:
+            totals: dict[str, int] = {}
+            counts: dict[str, int] = {}
+            for (fjson,) in fill_rows:
+                try:
+                    fdata = json.loads(fjson)
+                    for k, v in fdata.items():
+                        totals[k] = totals.get(k, 0) + int(v)
+                        counts[k] = counts.get(k, 0) + 1
+                except Exception:
+                    pass
+            field_fill_rates = {
+                k: round(totals[k] / counts[k] * 100, 1)
+                for k in totals
+                if counts[k] > 0
+            }
+
+    def r1(v: Any) -> Any:
+        return round(v, 1) if v is not None else None
+
+    return {
+        "total_notes_purged": total,
+        "by_format": by_format,
+        "by_template": by_template,
+        "avg_generation_time_ms": r1(avgs[0]) if avgs else None,
+        "avg_ai_output_chars": r1(avgs[1]) if avgs else None,
+        "avg_final_output_chars": r1(avgs[2]) if avgs else None,
+        "copy_rate_pct": r1(avgs[3]) if avgs else None,
+        "edit_rate_pct": r1(avgs[4]) if avgs else None,
+        "avg_edited_sections": r1(avgs[5]) if avgs else None,
+        "avg_diagnosis_count": r1(avgs[6]) if avgs else None,
+        "avg_interventions_count": r1(avgs[7]) if avgs else None,
+        "top_session_types": top3("session_type"),
+        "top_treatment_modalities": top3("treatment_modality"),
+        "top_durations": top3("duration_minutes"),
+        "risk_level_distribution": risk_dist,
+        "field_fill_rates_pct": field_fill_rates,
     }
