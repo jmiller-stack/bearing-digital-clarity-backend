@@ -209,7 +209,7 @@ class NoteRequest(BaseModel):
     duration_minutes: int | None = None
     session_type: str | None = None
     note_format: str
-    note_template_id: int | None = None
+    note_template_id: int | str | None = None
     note_template_name: str | None = None
     primary_diagnosis: list[str] | str | None = None
     treatment_modality: str | None = None
@@ -626,6 +626,14 @@ def build_system_prompt(
 def normalize_note_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     normalized["note_format"] = str(payload.get("note_format") or "SOAP").upper()
+    template_id = payload.get("note_template_id")
+    if template_id in ("", None):
+        normalized["note_template_id"] = None
+    else:
+        try:
+            normalized["note_template_id"] = int(template_id)
+        except (TypeError, ValueError):
+            normalized["note_template_id"] = None
     normalized["primary_diagnosis"] = normalize_diagnoses(payload.get("primary_diagnosis"))
     normalized["note_template_name"] = (payload.get("note_template_name") or "").strip() or None
     normalized["interventions_checked"] = [
