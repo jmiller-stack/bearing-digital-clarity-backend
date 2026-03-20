@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -6,9 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from apscheduler.schedulers.background import BackgroundScheduler
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
@@ -19,17 +23,92 @@ DB_PATH = BASE_DIR / "clarity_prototype.db"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "anthropic/claude-sonnet-4-5"
 
+# ---------------------------------------------------------------------------
+# Database encryption — AES-256-GCM, application-layer column encryption
+#
+# Approach: selected PHI columns are encrypted before being written to
+# SQLite and decrypted after reading. The database file itself remains
+# standard SQLite (no SQLCipher dependency), so this works on any host
+# including Railway's NixPacks build environment.
+#
+# Encrypted columns:
+#   client_name, primary_diagnosis, input_payload, ai_output,
+#   final_output, edits, feedback_notes
+#
+# Algorithm: AES-256-GCM (256-bit key, 96-bit random nonce per value).
+# Stored format: base64(nonce[12] || ciphertext).
+#
+# Key: set DB_ENCRYPTION_KEY in the Railway environment (or .env locally)
+# to a 32-byte base64url-encoded value. Generate one with:
+#   python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+#
+# Migration safety: decrypt_field() falls back to returning the raw value
+# when decryption fails, so existing plaintext rows (and the purge
+# sentinel values '{}' / '[purged]') continue to work without a migration.
+# ---------------------------------------------------------------------------
+
+
+def _load_cipher() -> AESGCM:
+    raw = os.getenv("DB_ENCRYPTION_KEY", "")
+    if not raw:
+        raise RuntimeError(
+            "DB_ENCRYPTION_KEY is not set. "
+            "Set this environment variable to a 32-byte base64url-encoded key. "
+            "Generate one with: "
+            "python -c \"import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())\""
+        )
+    try:
+        key_bytes = base64.urlsafe_b64decode(raw + "==")
+    except Exception as exc:
+        raise ValueError(f"DB_ENCRYPTION_KEY could not be base64-decoded: {exc}") from exc
+    if len(key_bytes) != 32:
+        raise ValueError(
+            f"DB_ENCRYPTION_KEY must decode to exactly 32 bytes for AES-256 "
+            f"(got {len(key_bytes)} bytes)."
+        )
+    return AESGCM(key_bytes)
+
+
+_CIPHER: AESGCM = _load_cipher()
+
+
+def encrypt_field(plaintext: str | None) -> str | None:
+    """Encrypt a string value with AES-256-GCM. Returns base64(nonce || ciphertext)."""
+    if plaintext is None:
+        return None
+    nonce = os.urandom(12)  # 96-bit random nonce — unique per encryption
+    ciphertext = _CIPHER.encrypt(nonce, plaintext.encode("utf-8"), None)
+    return base64.b64encode(nonce + ciphertext).decode("ascii")
+
+
+def decrypt_field(stored: str | None) -> str | None:
+    """Decrypt a value produced by encrypt_field().
+
+    Falls back to returning the raw value if decryption fails so that
+    existing plaintext rows and purge sentinels (e.g. '{}', '[purged]')
+    are handled transparently without a migration step.
+    """
+    if stored is None:
+        return None
+    try:
+        raw = base64.b64decode(stored)
+        nonce, ciphertext = raw[:12], raw[12:]
+        return _CIPHER.decrypt(nonce, ciphertext, None).decode("utf-8")
+    except Exception:
+        # Value is either plaintext (pre-encryption data) or a purge sentinel.
+        return stored
+
 
 SECTION_CONFIG = {
     "SOAP": [
         {"key": "subjective", "short": "S", "title": "Subjective", "clipboard": "SUBJECTIVE"},
         {"key": "objective", "short": "O", "title": "Objective", "clipboard": "OBJECTIVE"},
-        {"key": "assessment", "short": "A", "title": "Assessment", "clipboard": "ASSESSMENT"},
+        {"key": "assessment", "short": "A", "title": "Clinical Summary (Draft)", "clipboard": "CLINICAL SUMMARY"},
         {"key": "plan", "short": "P", "title": "Plan", "clipboard": "PLAN"},
     ],
     "DAP": [
         {"key": "data", "short": "D", "title": "Data", "clipboard": "DATA"},
-        {"key": "assessment", "short": "A", "title": "Assessment", "clipboard": "ASSESSMENT"},
+        {"key": "assessment", "short": "A", "title": "Clinical Summary (Draft)", "clipboard": "CLINICAL SUMMARY"},
         {"key": "plan", "short": "P", "title": "Plan", "clipboard": "PLAN"},
     ],
     "BIRP": [
@@ -55,7 +134,7 @@ RULES:
 SECTION GUIDELINES:
 - Subjective: client self-report, symptom changes, homework completion, reported mood/affect, significant quotes or statements, and denial of SI/HI when risk level is low or none.
 - Objective: therapist observations mapped from the structured data including affect, engagement, eye contact, appearance, speech, thought process, and any skills or behaviors observed in session.
-- Assessment: clinical interpretation of the session, exact reported progress level, treatment response, diagnostic consistency, emerging themes, and risk assessment.
+- Clinical Summary (Draft): document the clinician's summary of session progress, treatment response, emerging themes, and risk considerations as reported by the clinician. Do not provide independent diagnostic conclusions.
 - Plan: next session focus, homework assigned, interventions to continue or introduce, frequency, and next appointment if noted.
 
 OUTPUT FORMAT:
@@ -76,7 +155,7 @@ RULES:
 
 SECTION GUIDELINES:
 - Data: combine client report, therapist observations, interventions used, and response to interventions into a cohesive factual account of the session.
-- Assessment: provide clinical interpretation, exact reported progress level, diagnostic consistency, treatment response, and risk assessment.
+- Clinical Summary (Draft): document the clinician's summary of session progress, treatment response, diagnostic considerations, and risk assessment as reported by the clinician. Do not provide independent diagnostic conclusions.
 - Plan: outline next session focus, homework, interventions to continue or introduce, frequency, and next appointment if provided.
 
 OUTPUT FORMAT:
@@ -154,6 +233,12 @@ class FeedbackRequest(BaseModel):
     feedback_notes: str = ""
 
 
+class CorrectDataRequest(BaseModel):
+    note_id: int
+    field: str   # must be in CORRECTABLE_FIELDS
+    value: str
+
+
 app = FastAPI(title="Clarity Prototype API")
 app.add_middleware(
     CORSMiddleware,
@@ -162,6 +247,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+scheduler = BackgroundScheduler()
+
+
+def purge_expired_session_data() -> None:
+    """Null out PHI/input fields on records older than 30 minutes."""
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE note_generations
+            SET input_payload = '{}', ai_output = '{}',
+                client_name = '[purged]', primary_diagnosis = NULL,
+                final_output = NULL
+            WHERE created_at < datetime('now', '-30 minutes')
+              AND input_payload != '{}'
+            """
+        )
+        connection.commit()
 
 
 def get_connection() -> sqlite3.Connection:
@@ -204,11 +307,150 @@ def init_db() -> None:
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+    scheduler.add_job(purge_expired_session_data, "interval", minutes=30, id="session_purge")
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    scheduler.shutdown(wait=False)
 
 
 @app.get("/api/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# NOTE: baa.docx should also be copied to the GitHub Pages frontend static assets
+# (jmiller-stack/bearing-digital-clarity repo) so it can be served directly at
+# https://clarity.bearingdigital.com/legal/baa.docx without going through the backend.
+BAA_PATH = BASE_DIR.parent / "legal" / "baa.docx"
+
+
+@app.get("/legal/baa")
+def download_baa() -> FileResponse:
+    """Serve the HIPAA Business Associate Agreement as a downloadable .docx file."""
+    if not BAA_PATH.exists():
+        raise HTTPException(status_code=404, detail="BAA document not found.")
+    return FileResponse(
+        path=str(BAA_PATH),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename="Clarity-HIPAA-BAA.docx",
+    )
+
+
+# ---------------------------------------------------------------------------
+# MODPA 2026 Consumer Data Rights (Maryland Online Data Privacy Act)
+# These endpoints fulfill the Right to Access, Correct, and Delete obligations
+# for Maryland behavioral health providers using Clarity. Bearing Digital
+# must respond to any Attorney General inquiry by pointing to these routes.
+# ---------------------------------------------------------------------------
+
+# Fields that a user is permitted to correct via the PUT endpoint.
+# Kept narrow to prevent accidental overwrite of clinical record fields.
+_CORRECTABLE_FIELDS = frozenset({"client_name", "primary_diagnosis"})
+
+
+@app.get("/api/user/data")
+def get_user_data() -> dict[str, Any]:
+    """MODPA 2026 — Right to Access.
+
+    Returns a complete JSON export of all session records stored in Clarity.
+    The frontend triggers a file download so the clinician can save a local copy.
+    Note: this prototype has no authentication layer; in production this endpoint
+    must be scoped to an authenticated user account.
+    """
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM note_generations ORDER BY created_at DESC"
+        ).fetchall()
+
+    records = [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "client_name": decrypt_field(row["client_name"]),
+            "session_number": row["session_number"],
+            "session_date": row["session_date"],
+            "duration_minutes": row["duration_minutes"],
+            "session_type": row["session_type"],
+            "note_format": row["note_format"],
+            "primary_diagnosis": decrypt_field(row["primary_diagnosis"]),
+            "treatment_modality": row["treatment_modality"],
+            "input_payload": parse_json_field(decrypt_field(row["input_payload"]), default={}),
+            "ai_output": parse_json_field(decrypt_field(row["ai_output"]), default={}),
+            "ai_model": row["ai_model"],
+            "generation_time_ms": row["generation_time_ms"],
+            "edits": parse_json_field(decrypt_field(row["edits"]), default={}),
+            "final_output": decrypt_field(row["final_output"]),
+            "copied_at": row["copied_at"],
+            "feedback_rating": row["feedback_rating"],
+            "feedback_notes": decrypt_field(row["feedback_notes"]),
+        }
+        for row in rows
+    ]
+
+    return {
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "service": "Clarity by Bearing Digital",
+        "record_count": len(records),
+        "records": records,
+    }
+
+
+@app.put("/api/user/data/correct")
+def correct_user_data(request: CorrectDataRequest) -> dict[str, Any]:
+    """MODPA 2026 — Right to Correct.
+
+    Allows a clinician to update a specific correctable field on a stored session
+    record (e.g., fix a mis-entered client name or diagnosis label). Only fields
+    in _CORRECTABLE_FIELDS may be changed to prevent inadvertent modification of
+    clinical output. The field name is validated against a whitelist before
+    interpolation into the SQL statement.
+    """
+    if request.field not in _CORRECTABLE_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field '{request.field}' cannot be corrected via this endpoint. "
+                   f"Allowed fields: {sorted(_CORRECTABLE_FIELDS)}",
+        )
+
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT id FROM note_generations WHERE id = ?", (request.note_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Note not found.")
+
+        # Safe: field name is validated against _CORRECTABLE_FIELDS whitelist above.
+        # Value is encrypted before storage to maintain at-rest encryption consistency.
+        connection.execute(
+            f"UPDATE note_generations SET {request.field} = ? WHERE id = ?",  # noqa: S608
+            (encrypt_field(request.value.strip()), request.note_id),
+        )
+        connection.commit()
+
+    return {"note_id": request.note_id, "field": request.field, "corrected": True}
+
+
+@app.delete("/api/user/data")
+def delete_user_data() -> dict[str, Any]:
+    """MODPA 2026 — Right to Delete.
+
+    Permanently removes ALL session records from the database. This is a hard
+    delete with no soft-delete or recovery path, satisfying the 'erasure' right
+    under MODPA. The clinician is prompted with a confirmation dialog on the
+    frontend before this endpoint is called.
+    """
+    with get_connection() as connection:
+        result = connection.execute(
+            "SELECT COUNT(*) AS count FROM note_generations"
+        ).fetchone()
+        deleted_count = result["count"] if result else 0
+        connection.execute("DELETE FROM note_generations")
+        connection.commit()
+
+    return {"deleted": True, "records_deleted": deleted_count}
 
 
 @app.post("/api/generate-note")
@@ -248,16 +490,16 @@ def save_note_edits(note_id: int, request: EditRequest) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Note not found.")
 
         note_format = row["note_format"]
-        current_edits = parse_json_field(row["edits"], default={})
+        current_edits = parse_json_field(decrypt_field(row["edits"]), default={})
         current_edits.update({key: value.strip() for key, value in request.edits.items() if value.strip()})
 
         final_output = build_plaintext_output(
-            build_metadata(parse_json_field(row["input_payload"], default={})),
-            build_section_state(note_format, parse_json_field(row["ai_output"], default={}), current_edits),
+            build_metadata(parse_json_field(decrypt_field(row["input_payload"]), default={})),
+            build_section_state(note_format, parse_json_field(decrypt_field(row["ai_output"]), default={}), current_edits),
         )
         connection.execute(
             "UPDATE note_generations SET edits = ?, final_output = ? WHERE id = ?",
-            (json.dumps(current_edits), final_output, note_id),
+            (encrypt_field(json.dumps(current_edits)), encrypt_field(final_output), note_id),
         )
         connection.commit()
 
@@ -277,11 +519,33 @@ def mark_note_copied(note_id: int, request: CopyRequest) -> dict[str, Any]:
             SET final_output = ?, copied_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (request.final_output, note_id),
+            (encrypt_field(request.final_output), note_id),
         )
         connection.commit()
 
     return {"note_id": note_id, "copied": True}
+
+
+@app.delete("/api/notes/{note_id}/purge")
+def purge_note_session(note_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        row = connection.execute("SELECT id FROM note_generations WHERE id = ?", (note_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Note not found.")
+
+        connection.execute(
+            """
+            UPDATE note_generations
+            SET input_payload = '{}', ai_output = '{}',
+                client_name = '[purged]', primary_diagnosis = NULL,
+                final_output = NULL
+            WHERE id = ?
+            """,
+            (note_id,),
+        )
+        connection.commit()
+
+    return {"note_id": note_id, "purged": True}
 
 
 @app.post("/api/notes/{note_id}/feedback")
@@ -297,7 +561,7 @@ def save_feedback(note_id: int, request: FeedbackRequest) -> dict[str, Any]:
             SET feedback_rating = ?, feedback_notes = ?
             WHERE id = ?
             """,
-            (request.feedback_rating, request.feedback_notes.strip(), note_id),
+            (request.feedback_rating, encrypt_field(request.feedback_notes.strip()), note_id),
         )
         connection.commit()
 
@@ -319,18 +583,18 @@ def list_notes() -> dict[str, list[dict[str, Any]]]:
 
     notes = []
     for row in rows:
-        edits = parse_json_field(row["edits"], default={})
+        edits = parse_json_field(decrypt_field(row["edits"]), default={})
         notes.append(
             {
                 "id": row["id"],
                 "created_at": row["created_at"],
-                "client_name": row["client_name"],
+                "client_name": decrypt_field(row["client_name"]),
                 "session_number": row["session_number"],
                 "session_date": row["session_date"],
                 "duration_minutes": row["duration_minutes"],
                 "session_type": row["session_type"],
                 "note_format": row["note_format"],
-                "primary_diagnosis": row["primary_diagnosis"],
+                "primary_diagnosis": decrypt_field(row["primary_diagnosis"]),
                 "treatment_modality": row["treatment_modality"],
                 "generation_time_ms": row["generation_time_ms"],
                 "copied_at": row["copied_at"],
@@ -349,11 +613,12 @@ def get_note(note_id: int) -> dict[str, Any]:
         if row is None:
             raise HTTPException(status_code=404, detail="Note not found.")
 
-    input_payload = parse_json_field(row["input_payload"], default={})
-    ai_output = parse_json_field(row["ai_output"], default={})
-    edits = parse_json_field(row["edits"], default={})
+    input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
+    ai_output = parse_json_field(decrypt_field(row["ai_output"]), default={})
+    edits = parse_json_field(decrypt_field(row["edits"]), default={})
     metadata = build_metadata(input_payload)
     sections = build_section_state(row["note_format"], ai_output, edits)
+    final_output = decrypt_field(row["final_output"])
 
     return {
         "id": row["id"],
@@ -370,9 +635,9 @@ def get_note(note_id: int) -> dict[str, Any]:
             "copied": bool(row["copied_at"]),
             "copied_at": row["copied_at"],
             "feedback_rating": row["feedback_rating"],
-            "feedback_notes": row["feedback_notes"],
+            "feedback_notes": decrypt_field(row["feedback_notes"]),
         },
-        "final_output": row["final_output"] or build_plaintext_output(metadata, sections),
+        "final_output": final_output or build_plaintext_output(metadata, sections),
     }
 
 
@@ -387,6 +652,7 @@ async def call_openrouter(note_format: str, payload: dict[str, Any], api_key: st
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        "provider": {"data_collection": "deny"},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -545,16 +811,16 @@ def save_generated_note(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                payload.get("client_name"),
+                encrypt_field(payload.get("client_name")),
                 payload.get("session_number"),
                 payload.get("session_date"),
                 payload.get("duration_minutes"),
                 payload.get("session_type"),
                 note_format,
-                payload.get("primary_diagnosis"),
+                encrypt_field(payload.get("primary_diagnosis")),
                 payload.get("treatment_modality"),
-                json.dumps(payload),
-                json.dumps(sections),
+                encrypt_field(json.dumps(payload)),
+                encrypt_field(json.dumps(sections)),
                 generation_time_ms,
             ),
         )
