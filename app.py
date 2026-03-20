@@ -11,7 +11,7 @@ import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -23,7 +23,121 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "clarity_prototype.db"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "anthropic/claude-sonnet-4-5"
+OPENROUTER_AUDIO_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+OPENAI_AUDIO_URL = "https://api.openai.com/v1/audio/transcriptions"
 HCC_TEMPLATE_NAME = "HCC SOAP Note"
+SUPPORTED_AUDIO_EXTENSIONS = {".webm", ".mp4", ".m4a", ".mp3", ".wav", ".mpeg"}
+VOICE_EXTRACTABLE_KEYS = {
+    "client_report",
+    "interventions_checked",
+    "interventions_description",
+    "affect",
+    "engagement",
+    "eye_contact",
+    "appearance",
+    "speech",
+    "thought_process",
+    "additional_observations",
+    "client_response",
+    "progress",
+    "risk_level",
+    "risk_details",
+    "plan_next_session",
+    "homework",
+    "next_appointment",
+    "treatment_goals",
+    "primary_diagnosis",
+}
+VOICE_ALLOWED_INTERVENTIONS = {
+    "CBT",
+    "TF-CBT",
+    "DBT skills",
+    "EFT",
+    "Gottman Method",
+    "Mindfulness/grounding",
+    "Psychoeducation",
+    "Motivational Interviewing",
+    "Safety planning",
+    "Mind/Body Connection",
+    "ACT",
+    "Communication skills training",
+    "Other",
+}
+VOICE_ENUM_FIELDS = {
+    "affect": {
+        "Depressed",
+        "Anxious",
+        "Flat",
+        "Constricted",
+        "Euthymic",
+        "Bright",
+        "Labile",
+        "Irritable",
+        "Tearful",
+    },
+    "engagement": {
+        "Fully engaged",
+        "Mostly engaged",
+        "Partially engaged",
+        "Minimally engaged",
+        "Resistant",
+    },
+    "eye_contact": {"Consistent", "Intermittent", "Avoidant", "N/A-Telehealth"},
+    "appearance": {"Well-groomed", "Casually dressed", "Disheveled", "Unremarkable", "N/A-Telehealth"},
+    "speech": {
+        "Normal rate & volume",
+        "Pressured",
+        "Slow",
+        "Soft",
+        "Monotone",
+        "Unremarkable",
+    },
+    "thought_process": {
+        "Logical & goal-directed",
+        "Tangential",
+        "Circumstantial",
+        "Racing",
+        "Perseverative",
+        "Unremarkable",
+    },
+    "progress": {
+        "Significant progress",
+        "Some progress",
+        "No notable change",
+        "Regression",
+        "Too early to assess",
+    },
+    "risk_level": {
+        "No risk indicators",
+        "Low risk — no imminent concern",
+        "Moderate risk — discussed safety plan",
+        "High risk — safety plan activated / crisis protocol",
+    },
+}
+VOICE_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a clinical documentation assistant. Given a therapist verbal session "
+    "summary, extract structured data to populate a therapy progress note form. "
+    "Return ONLY a valid JSON object with these keys (omit keys where information "
+    "is not mentioned): client_report, interventions_checked (array of strings "
+    "matching: CBT, TF-CBT, DBT skills, EFT, Gottman Method, Mindfulness/grounding, "
+    "Psychoeducation, Motivational Interviewing, Safety planning, Mind/Body "
+    "Connection, ACT, Communication skills training, Other), "
+    "interventions_description, affect (one of: Depressed, Anxious, Flat, "
+    "Constricted, Euthymic, Bright, Labile, Irritable, Tearful), engagement "
+    "(one of: Fully engaged, Mostly engaged, Partially engaged, Minimally engaged, "
+    "Resistant), eye_contact (one of: Consistent, Intermittent, Avoidant, "
+    "N/A-Telehealth), appearance (one of: Well-groomed, Casually dressed, "
+    "Disheveled, Unremarkable, N/A-Telehealth), speech (one of: Normal rate & "
+    "volume, Pressured, Slow, Soft, Monotone, Unremarkable), thought_process "
+    "(one of: Logical & goal-directed, Tangential, Circumstantial, Racing, "
+    "Perseverative, Unremarkable), additional_observations, client_response, "
+    "progress (one of: Significant progress, Some progress, No notable change, "
+    "Regression, Too early to assess), risk_level (one of: No risk indicators, "
+    "Low risk — no imminent concern, Moderate risk — discussed safety plan, High "
+    "risk — safety plan activated / crisis protocol), risk_details, "
+    "plan_next_session, homework, next_appointment, treatment_goals, "
+    "primary_diagnosis (array of strings)."
+)
 
 # ---------------------------------------------------------------------------
 # Database encryption — AES-256-GCM, application-layer column encryption
@@ -873,14 +987,29 @@ async def call_openrouter(
 ) -> str:
     system_prompt = build_system_prompt(note_format, section_config, template_name)
     user_prompt = build_user_prompt(payload, note_format, template_name)
-    request_body = {
-        "model": OPENROUTER_MODEL,
-        "max_tokens": 2400,
-        "temperature": 0.3,
-        "messages": [
+    return await call_openrouter_chat(
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        api_key=api_key,
+        max_tokens=2400,
+        temperature=0.3,
+    )
+
+
+async def call_openrouter_chat(
+    messages: list[dict[str, str]],
+    api_key: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    request_body = {
+        "model": OPENROUTER_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": messages,
         "provider": {"data_collection": "deny"},
     }
     headers = {
@@ -908,6 +1037,143 @@ async def call_openrouter(
         return content.strip()
 
     raise HTTPException(status_code=502, detail="OpenRouter returned no note content.")
+
+
+def validate_audio_upload(audio: UploadFile) -> None:
+    suffix = Path(audio.filename or "").suffix.lower()
+    if suffix and suffix not in SUPPORTED_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported audio file type.")
+    if audio.content_type and not audio.content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be audio.")
+
+
+async def transcribe_audio_upload(audio: UploadFile) -> str:
+    validate_audio_upload(audio)
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio upload was empty.")
+
+    filename = audio.filename or f"session-summary{Path(audio.filename or '.webm').suffix or '.webm'}"
+    content_type = audio.content_type or "application/octet-stream"
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+
+    files = {"file": (filename, audio_bytes, content_type)}
+    data = {"model": "whisper-1"}
+
+    if openai_key:
+        headers = {"Authorization": f"Bearer {openai_key}"}
+        url = OPENAI_AUDIO_URL
+    elif openrouter_key:
+        headers = {"Authorization": f"Bearer {openrouter_key}"}
+        url = OPENROUTER_AUDIO_URL
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY or OPENROUTER_API_KEY is required for transcription.",
+        )
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        response = await client.post(url, headers=headers, data=data, files=files)
+
+    if response.status_code >= 400:
+        detail = response.text
+        try:
+            parsed = response.json()
+            detail = parsed.get("error", {}).get("message") or parsed.get("message") or detail
+        except json.JSONDecodeError:
+            pass
+        raise HTTPException(status_code=502, detail=f"Transcription request failed: {detail}")
+
+    body = response.json()
+    transcript = str(body.get("text") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=502, detail="Transcription returned no text.")
+
+    return transcript
+
+
+def parse_json_object(raw_output: str) -> dict[str, Any]:
+    cleaned = raw_output.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=502, detail=f"Model output was not valid JSON: {error}") from error
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=502, detail="Model output was not a JSON object.")
+
+    return parsed
+
+
+def normalize_extracted_fields(raw_fields: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+
+    for key, value in raw_fields.items():
+        if key not in VOICE_EXTRACTABLE_KEYS:
+            continue
+
+        if key == "interventions_checked":
+            if not isinstance(value, list):
+                continue
+            cleaned_list = []
+            for item in value:
+                text = str(item).strip()
+                if text and text in VOICE_ALLOWED_INTERVENTIONS and text not in cleaned_list:
+                    cleaned_list.append(text)
+            if cleaned_list:
+                normalized[key] = cleaned_list
+            continue
+
+        if key == "primary_diagnosis":
+            diagnoses = normalize_diagnoses(value if isinstance(value, list) else [value])
+            if diagnoses:
+                normalized[key] = diagnoses
+            continue
+
+        text = str(value).strip()
+        if not text:
+            continue
+
+        allowed_values = VOICE_ENUM_FIELDS.get(key)
+        if allowed_values and text not in allowed_values:
+            continue
+
+        normalized[key] = text
+
+    return normalized
+
+
+async def extract_session_fields(
+    transcript: str,
+    note_format: str,
+    note_template_name: str | None,
+    api_key: str,
+) -> dict[str, Any]:
+    user_prompt = "\n".join(
+        [
+            f"Note format: {note_format or 'SOAP'}",
+            f"Note template name: {note_template_name or 'Default (SOAP/DAP/BIRP)'}",
+            "",
+            "Therapist session summary transcript:",
+            transcript,
+        ]
+    )
+    raw_output = await call_openrouter_chat(
+        [
+            {"role": "system", "content": VOICE_EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        api_key=api_key,
+        max_tokens=1400,
+        temperature=0.1,
+    )
+    return normalize_extracted_fields(parse_json_object(raw_output))
 
 
 @app.get("/api/templates")
@@ -965,6 +1231,33 @@ def create_template(
         "name": name,
         "sections_json": sections,
         "is_builtin": False,
+    }
+
+
+@app.post("/api/transcribe-and-extract")
+async def transcribe_and_extract(
+    audio: UploadFile = File(...),
+    note_format: str = Form(default="SOAP"),
+    note_template_name: str = Form(default=""),
+    x_user_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_user_id(x_user_id)
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if not openrouter_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is required for field extraction.")
+
+    transcript = await transcribe_audio_upload(audio)
+    extracted_fields = await extract_session_fields(
+        transcript,
+        note_format=(note_format or "SOAP").upper(),
+        note_template_name=note_template_name.strip() or None,
+        api_key=openrouter_key,
+    )
+
+    return {
+        "transcript": transcript,
+        "extracted_fields": extracted_fields,
+        "fields_populated": len(extracted_fields),
     }
 
 
