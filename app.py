@@ -1,23 +1,121 @@
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
+import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
+from authlib.integrations.starlette_client import OAuth
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, Field
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text, create_engine
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.pool import NullPool
+from starlette.middleware.sessions import SessionMiddleware
 
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy — PostgreSQL (prod) or SQLite (local dev) for auth tables
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if DATABASE_URL:
+    # Railway provides postgres:// but SQLAlchemy needs postgresql://
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    _engine = create_engine(DATABASE_URL, poolclass=NullPool)
+else:
+    _sqlite_auth_path = str(Path(__file__).resolve().parent / "auth.db")
+    _engine = create_engine(f"sqlite:///{_sqlite_auth_path}", connect_args={"check_same_thread": False})
+
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=_engine)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    encrypted_email = Column(Text, nullable=True)
+    email_lookup_hash = Column(String(64), unique=True, nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    sso_accounts = relationship("SSOAccount", back_populates="user", cascade="all, delete-orphan")
+    sessions = relationship("ActiveSession", back_populates="user", cascade="all, delete-orphan")
+
+
+class SSOAccount(Base):
+    __tablename__ = "sso_accounts"
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    provider = Column(String(32), nullable=False)
+    provider_id = Column(String(128), nullable=False)
+    user = relationship("User", back_populates="sso_accounts")
+    __table_args__ = (Index("ix_sso_provider_provider_id", "provider", "provider_id", unique=True),)
+
+
+class ActiveSession(Base):
+    __tablename__ = "active_sessions"
+    token_hash = Column(String(64), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    user = relationship("User", back_populates="sessions")
+
+
+def _create_auth_tables() -> None:
+    Base.metadata.create_all(_engine)
+
+
+# ---------------------------------------------------------------------------
+# Auth config
+# ---------------------------------------------------------------------------
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://clarity.bearingdigital.com")
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+BACKEND_URL = os.getenv("BACKEND_URL", "https://web-production-d6d7d.up.railway.app")
+
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") or os.getenv("DB_ENCRYPTION_KEY", "")
+HMAC_SECRET = os.getenv("HMAC_SECRET", ENCRYPTION_KEY)
+
+# In-memory short-code store: {code: (user_id, expires_at)}
+auth_codes: dict[str, tuple[str, datetime]] = {}
+
+oauth = OAuth()
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    oauth.register(
+        name="google",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+
+
+def email_lookup_hash(email: str) -> str:
+    """Deterministic HMAC-SHA256 for email lookups — same input always same output."""
+    secret = HMAC_SECRET.encode() if HMAC_SECRET else b"fallback-dev-secret"
+    return hmac.new(secret, email.lower().strip().encode(), hashlib.sha256).hexdigest()
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "clarity_prototype.db"
@@ -380,6 +478,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", JWT_SECRET))
 
 scheduler = BackgroundScheduler()
 
@@ -397,6 +496,27 @@ def purge_expired_session_data() -> None:
             """
         )
         connection.commit()
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        expired_sessions = (
+            db.query(ActiveSession).filter(ActiveSession.expires_at < now).all()
+        )
+        expired_user_ids = [s.user_id for s in expired_sessions]
+        db.query(ActiveSession).filter(ActiveSession.expires_at < now).delete()
+        if expired_user_ids:
+            with get_connection() as conn:
+                placeholders = ",".join("?" * len(expired_user_ids))
+                conn.execute(
+                    f"UPDATE note_generations SET user_id = NULL WHERE user_id IN ({placeholders})",
+                    expired_user_ids,
+                )
+                conn.commit()
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def get_connection() -> sqlite3.Connection:
@@ -512,6 +632,7 @@ def seed_builtin_templates(connection: sqlite3.Connection) -> None:
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+    _create_auth_tables()
     scheduler.add_job(purge_expired_session_data, "interval", minutes=30, id="session_purge")
     scheduler.start()
 
@@ -538,6 +659,196 @@ def download_baa() -> FileResponse:
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename="Clarity-HIPAA-BAA.docx",
     )
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+
+def get_current_user(
+    request: Request,
+    x_user_id: str | None = Header(default=None),
+) -> str:
+    """Extract user_id from Bearer token (SQLAlchemy) or fall back to X-User-Id header."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token:
+            token_hash = hash_token(token)
+            db = SessionLocal()
+            try:
+                now = datetime.now(timezone.utc)
+                session_obj = (
+                    db.query(ActiveSession)
+                    .filter(
+                        ActiveSession.token_hash == token_hash,
+                        ActiveSession.expires_at > now,
+                    )
+                    .first()
+                )
+                if session_obj is not None:
+                    return str(session_obj.user_id)
+            finally:
+                db.close()
+            raise HTTPException(status_code=401, detail="Invalid or expired session.")
+    # Fallback: X-User-Id header (backward compatibility)
+    uid = (x_user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return uid
+
+
+# ---------------------------------------------------------------------------
+# OAuth / Auth endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/auth/login")
+async def auth_login(request: Request) -> RedirectResponse:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured.")
+    redirect_uri = f"{BACKEND_URL}/auth/callback"
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request) -> RedirectResponse:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured.")
+    try:
+        token = await oauth.google.authorize_access_token(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {exc}") from exc
+
+    userinfo = token.get("userinfo") or {}
+    email = (userinfo.get("email") or "").strip().lower()
+    provider_id = str(userinfo.get("sub") or "")
+
+    if not email or not provider_id:
+        raise HTTPException(status_code=400, detail="Could not retrieve user info from Google.")
+
+    lookup_hash = email_lookup_hash(email)
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email_lookup_hash == lookup_hash).first()
+        if user is None:
+            user = User(
+                id=str(uuid.uuid4()),
+                encrypted_email=encrypt_field(email),
+                email_lookup_hash=lookup_hash,
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(user)
+            db.flush()
+
+        sso = (
+            db.query(SSOAccount)
+            .filter(SSOAccount.provider == "google", SSOAccount.provider_id == provider_id)
+            .first()
+        )
+        if sso is None:
+            sso = SSOAccount(
+                id=str(uuid.uuid4()),
+                user_id=user.id,
+                provider="google",
+                provider_id=provider_id,
+            )
+            db.add(sso)
+
+        db.commit()
+        user_id = user.id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    short_code = secrets.token_urlsafe(32)
+    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
+
+    return RedirectResponse(url=f"{FRONTEND_URL}/?code={short_code}")
+
+
+class AuthExchangeRequest(BaseModel):
+    code: str
+
+
+@app.post("/auth/exchange")
+def auth_exchange(request: AuthExchangeRequest) -> dict[str, Any]:
+    code = request.code.strip()
+    entry = auth_codes.pop(code, None)
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired auth code.")
+    user_id, expires_at = entry
+    if datetime.now(timezone.utc) > expires_at:
+        raise HTTPException(status_code=400, detail="Auth code has expired.")
+
+    now = datetime.now(timezone.utc)
+    session_token = secrets.token_urlsafe(48)
+    token_hash = hash_token(session_token)
+    session_expires = now + timedelta(hours=24)
+
+    db = SessionLocal()
+    try:
+        session_obj = ActiveSession(
+            token_hash=token_hash,
+            user_id=user_id,
+            expires_at=session_expires,
+        )
+        db.add(session_obj)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return {"token": session_token, "expires_in": 86400}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request) -> dict[str, str]:
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token:
+            token_hash = hash_token(token)
+            db = SessionLocal()
+            try:
+                db.query(ActiveSession).filter(ActiveSession.token_hash == token_hash).delete()
+                db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+    return {"status": "logged out"}
+
+
+@app.get("/auth/me")
+def auth_me(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        raw_email = decrypt_field(user.encrypted_email) or ""
+        masked = ""
+        if raw_email:
+            parts = raw_email.split("@")
+            if len(parts) == 2:
+                local = parts[0]
+                masked = f"{local[:2]}{'*' * max(1, len(local) - 2)}@{parts[1]}"
+            else:
+                masked = raw_email[:3] + "***"
+        return {
+            "id": user.id,
+            "email_masked": masked,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+    finally:
+        db.close()
 
 
 _CORRECTABLE_FIELDS = frozenset({"client_name", "primary_diagnosis"})
@@ -1177,8 +1488,7 @@ async def extract_session_fields(
 
 
 @app.get("/api/templates")
-def list_templates(x_user_id: str | None = Header(default=None)) -> dict[str, list[dict[str, Any]]]:
-    user_id = require_user_id(x_user_id)
+def list_templates(user_id: str = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -1205,9 +1515,8 @@ def list_templates(x_user_id: str | None = Header(default=None)) -> dict[str, li
 
 @app.post("/api/templates")
 def create_template(
-    request: TemplateCreateRequest, x_user_id: str | None = Header(default=None)
+    request: TemplateCreateRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     name = request.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Template name is required.")
@@ -1239,9 +1548,8 @@ async def transcribe_and_extract(
     audio: UploadFile = File(...),
     note_format: str = Form(default="SOAP"),
     note_template_name: str = Form(default=""),
-    x_user_id: str | None = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    require_user_id(x_user_id)
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     if not openrouter_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is required for field extraction.")
@@ -1262,8 +1570,7 @@ async def transcribe_and_extract(
 
 
 @app.get("/api/user/data")
-def get_user_data(x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
+def get_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -1315,9 +1622,8 @@ def get_user_data(x_user_id: str | None = Header(default=None)) -> dict[str, Any
 
 @app.put("/api/user/data/correct")
 def correct_user_data(
-    request: CorrectDataRequest, x_user_id: str | None = Header(default=None)
+    request: CorrectDataRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     if request.field not in _CORRECTABLE_FIELDS:
         raise HTTPException(
             status_code=400,
@@ -1344,32 +1650,45 @@ def correct_user_data(
 
 
 @app.delete("/api/user/data")
-def delete_user_data(x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
+def delete_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
     with get_connection() as connection:
         result = connection.execute(
             """
             SELECT COUNT(*) AS count FROM note_generations
-            WHERE user_id = ? OR user_id IS NULL
+            WHERE user_id = ?
             """,
             (user_id,),
         ).fetchone()
         deleted_count = result["count"] if result else 0
+        # Anonymize note analytics rows before deleting note records
         connection.execute(
-            "DELETE FROM note_generations WHERE user_id = ? OR user_id IS NULL",
+            "UPDATE note_generations SET user_id = NULL WHERE user_id = ?",
             (user_id,),
         )
+        connection.execute("DELETE FROM note_generations WHERE user_id IS NULL AND client_name = '[purged]'")
         connection.execute("DELETE FROM templates WHERE user_id = ?", (user_id,))
         connection.commit()
+
+    # Delete auth records from PostgreSQL/SQLite auth DB
+    db = SessionLocal()
+    try:
+        db.query(ActiveSession).filter(ActiveSession.user_id == user_id).delete()
+        db.query(SSOAccount).filter(SSOAccount.user_id == user_id).delete()
+        db.query(User).filter(User.id == user_id).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
     return {"deleted": True, "records_deleted": deleted_count}
 
 
 @app.post("/api/generate-note")
 async def generate_note(
-    request: NoteRequest, x_user_id: str | None = Header(default=None)
+    request: NoteRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     payload = normalize_note_payload(request.model_dump())
     note_format = payload["note_format"]
     if note_format not in SECTION_CONFIG:
@@ -1409,9 +1728,8 @@ async def generate_note(
 
 @app.post("/api/notes/{note_id}/edits")
 def save_note_edits(
-    note_id: int, request: EditRequest, x_user_id: str | None = Header(default=None)
+    note_id: int, request: EditRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     with get_connection() as connection:
         row = fetch_note_for_user(connection, note_id, user_id)
         section_config = resolve_section_config(row["note_format"], row["section_config_json"])
@@ -1446,9 +1764,8 @@ def save_note_edits(
 
 @app.post("/api/notes/{note_id}/copied")
 def mark_note_copied(
-    note_id: int, request: CopyRequest, x_user_id: str | None = Header(default=None)
+    note_id: int, request: CopyRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     with get_connection() as connection:
         fetch_note_for_user(connection, note_id, user_id)
         connection.execute(
@@ -1523,8 +1840,7 @@ def _extract_analytics_row(row: sqlite3.Row, input_payload: dict[str, Any]) -> d
 
 
 @app.delete("/api/notes/{note_id}/purge")
-def purge_note_session(note_id: int, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
+def purge_note_session(note_id: int, user_id: str = Depends(get_current_user)) -> dict[str, Any]:
     with get_connection() as connection:
         row = fetch_note_for_user(connection, note_id, user_id)
         # Capture anonymized analytics before wiping PHI
@@ -1580,9 +1896,8 @@ def purge_note_session(note_id: int, x_user_id: str | None = Header(default=None
 
 @app.post("/api/notes/{note_id}/feedback")
 def save_feedback(
-    note_id: int, request: FeedbackRequest, x_user_id: str | None = Header(default=None)
+    note_id: int, request: FeedbackRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
     with get_connection() as connection:
         fetch_note_for_user(connection, note_id, user_id)
         connection.execute(
@@ -1599,8 +1914,7 @@ def save_feedback(
 
 
 @app.get("/api/notes")
-def list_notes(x_user_id: str | None = Header(default=None)) -> dict[str, list[dict[str, Any]]]:
-    user_id = require_user_id(x_user_id)
+def list_notes(user_id: str = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -1642,8 +1956,7 @@ def list_notes(x_user_id: str | None = Header(default=None)) -> dict[str, list[d
 
 
 @app.get("/api/notes/{note_id}")
-def get_note(note_id: int, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
-    user_id = require_user_id(x_user_id)
+def get_note(note_id: int, user_id: str = Depends(get_current_user)) -> dict[str, Any]:
     with get_connection() as connection:
         row = fetch_note_for_user(connection, note_id, user_id)
 

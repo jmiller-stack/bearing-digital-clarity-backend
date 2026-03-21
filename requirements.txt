@@ -5,3 +5,8 @@ python-dotenv
 apscheduler
 cryptography
 python-multipart
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+authlib
+itsdangerous
