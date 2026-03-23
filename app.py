@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, Field
-from passlib.context import CryptContext
+import bcrypt as _bcrypt_lib
 from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -78,7 +78,15 @@ class ActiveSession(Base):
     user = relationship("User", back_populates="sessions")
 
 
-pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+def _hash_password(password: str) -> str:
+    """SHA-256 pre-hash then bcrypt — avoids bcrypt 72-byte limit."""
+    digest = hashlib.sha256(password.encode()).hexdigest().encode()
+    return _bcrypt_lib.hashpw(digest, _bcrypt_lib.gensalt()).decode()
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    digest = hashlib.sha256(password.encode()).hexdigest().encode()
+    return _bcrypt_lib.checkpw(digest, hashed.encode())
 
 
 def _create_auth_tables() -> None:
@@ -901,7 +909,7 @@ def auth_register(payload: RegisterRequest) -> dict[str, Any]:
             id=str(uuid.uuid4()),
             encrypted_email=encrypt_field(email),
             email_lookup_hash=lookup_hash,
-            hashed_password=pwd_context.hash(payload.password),
+            hashed_password=_hash_password(payload.password),
             created_at=datetime.now(timezone.utc),
         )
         db.add(user)
@@ -934,7 +942,7 @@ def auth_login_password(payload: EmailLoginRequest) -> dict[str, Any]:
         user = db.query(User).filter(User.email_lookup_hash == lookup_hash).first()
         if user is None or not user.hashed_password:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
-        if not pwd_context.verify(payload.password, user.hashed_password):
+        if not _verify_password(payload.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         user_id = user.id
     except HTTPException:
