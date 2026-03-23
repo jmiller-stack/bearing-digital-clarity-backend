@@ -22,7 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text, create_engine
+from passlib.context import CryptContext
+from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 from starlette.middleware.sessions import SessionMiddleware
@@ -53,6 +54,7 @@ class User(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     encrypted_email = Column(Text, nullable=True)
     email_lookup_hash = Column(String(64), unique=True, nullable=True, index=True)
+    hashed_password = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     sso_accounts = relationship("SSOAccount", back_populates="user", cascade="all, delete-orphan")
     sessions = relationship("ActiveSession", back_populates="user", cascade="all, delete-orphan")
@@ -76,8 +78,27 @@ class ActiveSession(Base):
     user = relationship("User", back_populates="sessions")
 
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
 def _create_auth_tables() -> None:
     Base.metadata.create_all(_engine)
+    # Migrate: add hashed_password column if missing (for existing deployments)
+    with _engine.connect() as conn:
+        if DATABASE_URL:  # PostgreSQL
+            result = conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='users' AND column_name='hashed_password'"
+            ))
+            if result.fetchone() is None:
+                conn.execute(text("ALTER TABLE users ADD COLUMN hashed_password TEXT"))
+                conn.commit()
+        else:  # SQLite
+            result = conn.execute(text("PRAGMA table_info(users)"))
+            cols = {row[1] for row in result.fetchall()}
+            if "hashed_password" not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN hashed_password TEXT"))
+                conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +870,81 @@ def auth_me(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Email/password auth endpoints
+# ---------------------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+
+
+@app.post("/auth/register")
+def auth_register(payload: RegisterRequest) -> dict[str, Any]:
+    email = payload.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    lookup_hash = email_lookup_hash(email)
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.email_lookup_hash == lookup_hash).first()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        user = User(
+            id=str(uuid.uuid4()),
+            encrypted_email=encrypt_field(email),
+            email_lookup_hash=lookup_hash,
+            hashed_password=pwd_context.hash(payload.password),
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(user)
+        db.commit()
+        user_id = user.id
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    short_code = secrets.token_urlsafe(32)
+    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
+    return {"code": short_code}
+
+
+class EmailLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/login")
+def auth_login_password(payload: EmailLoginRequest) -> dict[str, Any]:
+    email = payload.email.strip().lower()
+    lookup_hash = email_lookup_hash(email)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email_lookup_hash == lookup_hash).first()
+        if user is None or not user.hashed_password:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        if not pwd_context.verify(payload.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        user_id = user.id
+    except HTTPException:
+        raise
+    finally:
+        db.close()
+
+    short_code = secrets.token_urlsafe(32)
+    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
+    return {"code": short_code}
 
 
 _CORRECTABLE_FIELDS = frozenset({"client_name", "primary_diagnosis"})
