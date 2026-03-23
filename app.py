@@ -78,7 +78,7 @@ class ActiveSession(Base):
     user = relationship("User", back_populates="sessions")
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
 
 def _create_auth_tables() -> None:
