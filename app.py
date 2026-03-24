@@ -17,7 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from authlib.integrations.starlette_client import OAuth
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from jose import JWTError, jwt as jose_jwt
@@ -138,7 +138,12 @@ if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
 
 def email_lookup_hash(email: str) -> str:
     """Deterministic HMAC-SHA256 for email lookups — same input always same output."""
-    secret = HMAC_SECRET.encode() if HMAC_SECRET else b"fallback-dev-secret"
+    if not HMAC_SECRET:
+        raise RuntimeError(
+            "HMAC_SECRET environment variable must be set. "
+            "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    secret = HMAC_SECRET.encode()
     return hmac.new(secret, email.lower().strip().encode(), hashlib.sha256).hexdigest()
 
 
@@ -500,12 +505,15 @@ class TemplateCreateRequest(BaseModel):
 
 
 app = FastAPI(title="Clarity Prototype API")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "https://clarity.bearingdigital.com")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-User-Id"],
 )
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", JWT_SECRET))
 
@@ -697,9 +705,8 @@ def download_baa() -> FileResponse:
 
 def get_current_user(
     request: Request,
-    x_user_id: str | None = Header(default=None),
 ) -> str:
-    """Extract user_id from Bearer token (SQLAlchemy) or fall back to X-User-Id header."""
+    """Extract user_id from Bearer token only. No fallback."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
@@ -720,12 +727,7 @@ def get_current_user(
                     return str(session_obj.user_id)
             finally:
                 db.close()
-            raise HTTPException(status_code=401, detail="Invalid or expired session.")
-    # Fallback: X-User-Id header (backward compatibility)
-    uid = (x_user_id or "").strip()
-    if not uid:
-        raise HTTPException(status_code=401, detail="Authentication required.")
-    return uid
+    raise HTTPException(status_code=401, detail="Authentication required.")
 
 
 # ---------------------------------------------------------------------------
@@ -956,17 +958,6 @@ def auth_login_password(payload: EmailLoginRequest) -> dict[str, Any]:
 
 
 _CORRECTABLE_FIELDS = frozenset({"client_name", "primary_diagnosis"})
-
-
-def normalize_user_id(x_user_id: str | None) -> str:
-    return (x_user_id or "").strip()
-
-
-def require_user_id(x_user_id: str | None) -> str:
-    user_id = normalize_user_id(x_user_id)
-    if not user_id:
-        raise HTTPException(status_code=400, detail="X-User-Id header is required.")
-    return user_id
 
 
 def slugify_key(value: str) -> str:
@@ -1335,7 +1326,7 @@ def fetch_note_for_user(connection: sqlite3.Connection, note_id: int, user_id: s
     row = connection.execute(
         """
         SELECT * FROM note_generations
-        WHERE id = ? AND (user_id = ? OR user_id IS NULL)
+        WHERE id = ? AND user_id = ?
         """,
         (note_id, user_id),
     ).fetchone()
@@ -1679,7 +1670,7 @@ def get_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
         rows = connection.execute(
             """
             SELECT * FROM note_generations
-            WHERE user_id = ? OR user_id IS NULL
+            WHERE user_id = ?
             ORDER BY created_at DESC
             """,
             (user_id,),
@@ -2026,7 +2017,7 @@ def list_notes(user_id: str = Depends(get_current_user)) -> dict[str, list[dict[
                    session_type, note_format, note_template_name, primary_diagnosis, treatment_modality,
                    generation_time_ms, copied_at, feedback_rating, edits
             FROM note_generations
-            WHERE user_id = ? OR user_id IS NULL
+            WHERE user_id = ?
             ORDER BY created_at DESC, id DESC
             """,
             (user_id,),
