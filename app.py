@@ -42,8 +42,17 @@ if DATABASE_URL:
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     _engine = create_engine(DATABASE_URL, poolclass=NullPool)
 else:
+    import warnings
+    warnings.warn(
+        "DATABASE_URL is not set. Falling back to local SQLite for auth (dev only). "
+        "Set DATABASE_URL to a PostgreSQL connection string in production.",
+        stacklevel=1,
+    )
     _sqlite_auth_path = str(Path(__file__).resolve().parent / "auth.db")
-    _engine = create_engine(f"sqlite:///{_sqlite_auth_path}", connect_args={"check_same_thread": False})
+    _engine = create_engine(
+        f"sqlite:///{_sqlite_auth_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
 
 Base = declarative_base()
 SessionLocal = sessionmaker(bind=_engine)
@@ -114,7 +123,12 @@ def _create_auth_tables() -> None:
 # ---------------------------------------------------------------------------
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://clarity.bearingdigital.com")
-JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET environment variable must be set. "
+        "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://web-production-d6d7d.up.railway.app")
@@ -124,6 +138,33 @@ HMAC_SECRET = os.getenv("HMAC_SECRET", ENCRYPTION_KEY)
 
 # In-memory short-code store: {code: (user_id, expires_at)}
 auth_codes: dict[str, tuple[str, datetime]] = {}
+_auth_codes_lock = __import__("threading").Lock()
+
+
+def _issue_auth_code(user_id: str) -> str:
+    """Generate a single-use auth code and prune expired entries."""
+    code = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=60)
+    now = datetime.now(timezone.utc)
+    with _auth_codes_lock:
+        expired = [k for k, v in auth_codes.items() if v[1] <= now]
+        for k in expired:
+            del auth_codes[k]
+        auth_codes[code] = (user_id, expires_at)
+    return code
+
+
+def _redeem_auth_code(code: str) -> str:
+    """Validate and consume a single-use auth code. Raises 400 if invalid/expired."""
+    now = datetime.now(timezone.utc)
+    with _auth_codes_lock:
+        entry = auth_codes.pop(code, None)
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired auth code.")
+    user_id, expires_at = entry
+    if now > expires_at:
+        raise HTTPException(status_code=400, detail="Auth code has expired.")
+    return user_id
 
 oauth = OAuth()
 if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
@@ -522,6 +563,30 @@ scheduler = BackgroundScheduler()
 
 def purge_expired_session_data() -> None:
     with get_connection() as connection:
+        # Archive analytics before purging
+        connection.execute(
+            """
+            INSERT INTO note_analytics (
+                purged_at, note_format, note_template_name, session_type,
+                duration_minutes, treatment_modality, diagnosis_count,
+                section_count, generation_time_ms, ai_output_char_count,
+                final_output_char_count, was_edited, was_copied, feedback_rating,
+                risk_level, interventions_count
+            )
+            SELECT
+                datetime('now'), note_format, note_template_name, session_type,
+                duration_minutes, treatment_modality,
+                CASE WHEN primary_diagnosis IS NOT NULL THEN 1 ELSE 0 END,
+                0, generation_time_ms, 0, 0,
+                CASE WHEN edits != '{}' THEN 1 ELSE 0 END,
+                CASE WHEN copied_at IS NOT NULL THEN 1 ELSE 0 END,
+                feedback_rating, NULL, 0
+            FROM note_generations
+            WHERE created_at < datetime('now', '-30 minutes')
+              AND input_payload != '{}'
+            """
+        )
+        # Purge PHI fields
         connection.execute(
             """
             UPDATE note_generations
@@ -796,9 +861,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     finally:
         db.close()
 
-    short_code = secrets.token_urlsafe(32)
-    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
-
+    short_code = _issue_auth_code(user_id)
     return RedirectResponse(url=f"{FRONTEND_URL}/?code={short_code}")
 
 
@@ -809,12 +872,7 @@ class AuthExchangeRequest(BaseModel):
 @app.post("/auth/exchange")
 def auth_exchange(request: AuthExchangeRequest) -> dict[str, Any]:
     code = request.code.strip()
-    entry = auth_codes.pop(code, None)
-    if entry is None:
-        raise HTTPException(status_code=400, detail="Invalid or expired auth code.")
-    user_id, expires_at = entry
-    if datetime.now(timezone.utc) > expires_at:
-        raise HTTPException(status_code=400, detail="Auth code has expired.")
+    user_id = _redeem_auth_code(code)
 
     now = datetime.now(timezone.utc)
     session_token = secrets.token_urlsafe(48)
@@ -925,8 +983,7 @@ def auth_register(payload: RegisterRequest) -> dict[str, Any]:
     finally:
         db.close()
 
-    short_code = secrets.token_urlsafe(32)
-    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
+    short_code = _issue_auth_code(user_id)
     return {"code": short_code}
 
 
@@ -952,8 +1009,7 @@ def auth_login_password(payload: EmailLoginRequest) -> dict[str, Any]:
     finally:
         db.close()
 
-    short_code = secrets.token_urlsafe(32)
-    auth_codes[short_code] = (user_id, datetime.now(timezone.utc) + timedelta(seconds=60))
+    short_code = _issue_auth_code(user_id)
     return {"code": short_code}
 
 
