@@ -64,6 +64,7 @@ class User(Base):
     encrypted_email = Column(Text, nullable=True)
     email_lookup_hash = Column(String(64), unique=True, nullable=True, index=True)
     hashed_password = Column(Text, nullable=True)
+    display_name = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     sso_accounts = relationship("SSOAccount", back_populates="user", cascade="all, delete-orphan")
     sessions = relationship("ActiveSession", back_populates="user", cascade="all, delete-orphan")
@@ -115,6 +116,22 @@ def _create_auth_tables() -> None:
             cols = {row[1] for row in result.fetchall()}
             if "hashed_password" not in cols:
                 conn.execute(text("ALTER TABLE users ADD COLUMN hashed_password TEXT"))
+                conn.commit()
+    # Migrate: add display_name column if missing
+    with _engine.connect() as conn:
+        if DATABASE_URL:  # PostgreSQL
+            result = conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='users' AND column_name='display_name'"
+            ))
+            if result.fetchone() is None:
+                conn.execute(text("ALTER TABLE users ADD COLUMN display_name TEXT"))
+                conn.commit()
+        else:  # SQLite
+            result = conn.execute(text("PRAGMA table_info(users)"))
+            cols = {row[1] for row in result.fetchall()}
+            if "display_name" not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN display_name TEXT"))
                 conn.commit()
 
 
@@ -545,6 +562,14 @@ class TemplateCreateRequest(BaseModel):
     sections_json: list[dict[str, Any]] | list[str]
 
 
+class ProfileUpdateRequest(BaseModel):
+    display_name: str
+
+
+class TakehomeRequest(BaseModel):
+    note_text: str
+
+
 app = FastAPI(title="Clarity Prototype API")
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "https://clarity.bearingdigital.com")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -820,6 +845,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     userinfo = token.get("userinfo") or {}
     email = (userinfo.get("email") or "").strip().lower()
     provider_id = str(userinfo.get("sub") or "")
+    google_name = (userinfo.get("name") or "").strip()
 
     if not email or not provider_id:
         raise HTTPException(status_code=400, detail="Could not retrieve user info from Google.")
@@ -834,10 +860,13 @@ async def auth_callback(request: Request) -> RedirectResponse:
                 id=str(uuid.uuid4()),
                 encrypted_email=encrypt_field(email),
                 email_lookup_hash=lookup_hash,
+                display_name=google_name or None,
                 created_at=datetime.now(timezone.utc),
             )
             db.add(user)
             db.flush()
+        elif google_name and not user.display_name:
+            user.display_name = google_name
 
         sso = (
             db.query(SSOAccount)
@@ -934,6 +963,7 @@ def auth_me(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
         return {
             "id": user.id,
             "email_masked": masked,
+            "display_name": user.display_name or "",
             "created_at": user.created_at.isoformat() if user.created_at else None,
         }
     finally:
@@ -970,6 +1000,7 @@ def auth_register(payload: RegisterRequest) -> dict[str, Any]:
             encrypted_email=encrypt_field(email),
             email_lookup_hash=lookup_hash,
             hashed_password=_hash_password(payload.password),
+            display_name=payload.name.strip() if payload.name else None,
             created_at=datetime.now(timezone.utc),
         )
         db.add(user)
@@ -1011,6 +1042,28 @@ def auth_login_password(payload: EmailLoginRequest) -> dict[str, Any]:
 
     short_code = _issue_auth_code(user_id)
     return {"code": short_code}
+
+
+@app.post("/auth/profile")
+def update_profile(request: ProfileUpdateRequest, user_id: str = Depends(get_current_user)) -> dict[str, Any]:
+    name = request.display_name.strip()
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Display name is too long (max 100 characters).")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        user.display_name = name or None
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    return {"display_name": name}
 
 
 _CORRECTABLE_FIELDS = frozenset({"client_name", "primary_diagnosis"})
@@ -2238,3 +2291,52 @@ def get_analytics_summary() -> dict[str, Any]:
         "risk_level_distribution": risk_dist,
         "field_fill_rates_pct": field_fill_rates,
     }
+
+
+# ---------------------------------------------------------------------------
+# Take-home summary generator
+# ---------------------------------------------------------------------------
+
+TAKEHOME_SYSTEM_PROMPT = """You are a compassionate therapy support assistant. Transform clinical session notes into warm, accessible take-home summaries for clients.
+
+RULES:
+- Write in second person ("Today we worked on..." / "In our session today...")
+- Use plain, everyday language — absolutely no clinical jargon
+- Keep it encouraging and strengths-focused
+- Length: 1–2 short paragraphs (80–150 words total)
+- Do NOT include diagnostic codes, risk details, or clinical labels
+- Transform clinical language into natural, human terms
+
+Examples of transformations:
+- "Utilized cognitive restructuring to address maladaptive thought patterns" → "Today we practiced catching 'thought traps' and replacing them with more balanced perspectives."
+- "Client demonstrated improved behavioral activation" → "You showed real progress in reconnecting with activities that bring you energy."
+- "Psychoeducation regarding anxiety response cycle" → "We talked about how anxiety works in your body and mind, and why it feels the way it does."
+- "Safety planning was reviewed" → "We checked in on your safety plan and made sure you feel supported."
+"""
+
+
+@app.post("/api/generate-takehome")
+async def generate_takehome(
+    request: TakehomeRequest, user_id: str = Depends(get_current_user)
+) -> dict[str, Any]:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not configured.")
+
+    note_text = request.note_text.strip()
+    if not note_text:
+        raise HTTPException(status_code=400, detail="Note text is required.")
+
+    user_prompt = f"Transform this clinical session note into a warm client take-home summary:\n\n{note_text}"
+
+    summary = await call_openrouter_chat(
+        [
+            {"role": "system", "content": TAKEHOME_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        api_key=api_key,
+        max_tokens=400,
+        temperature=0.5,
+    )
+
+    return {"summary": summary}
