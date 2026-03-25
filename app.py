@@ -5,7 +5,6 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -23,7 +22,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from jose import JWTError, jwt as jose_jwt
 from pydantic import BaseModel, Field
 import bcrypt as _bcrypt_lib
-from sqlalchemy import Column, DateTime, ForeignKey, Index, String, Text, create_engine, text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 from starlette.middleware.sessions import SessionMiddleware
@@ -86,6 +85,66 @@ class ActiveSession(Base):
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     user = relationship("User", back_populates="sessions")
+
+
+class NoteGeneration(Base):
+    __tablename__ = "note_generations"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    user_id = Column(String(36), nullable=True)
+    client_name = Column(Text, nullable=True)
+    session_number = Column(Integer, nullable=True)
+    session_date = Column(String(32), nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    session_type = Column(String(64), nullable=True)
+    note_format = Column(String(16), nullable=False)
+    note_template_name = Column(String(128), nullable=True)
+    section_config_json = Column(Text, nullable=True)
+    primary_diagnosis = Column(Text, nullable=True)
+    treatment_modality = Column(String(128), nullable=True)
+    input_payload = Column(Text, nullable=False, default="{}")
+    ai_output = Column(Text, nullable=False, default="{}")
+    ai_model = Column(String(64), default="anthropic/claude-sonnet-4-5")
+    generation_time_ms = Column(Integer, nullable=True)
+    edits = Column(Text, default="{}")
+    final_output = Column(Text, nullable=True)
+    copied_at = Column(DateTime(timezone=True), nullable=True)
+    feedback_rating = Column(String(16), nullable=True)
+    feedback_notes = Column(Text, nullable=True)
+
+
+class NoteTemplate(Base):
+    __tablename__ = "templates"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(36), nullable=True)
+    name = Column(String(128), nullable=False)
+    sections_json = Column(Text, nullable=False)
+    is_builtin = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class NoteAnalytic(Base):
+    __tablename__ = "note_analytics"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    note_id = Column(Integer, nullable=True)
+    purged_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    note_format = Column(String(16), nullable=True)
+    note_template_name = Column(String(128), nullable=True)
+    session_type = Column(String(64), nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    treatment_modality = Column(String(128), nullable=True)
+    diagnosis_count = Column(Integer, nullable=True)
+    section_count = Column(Integer, nullable=True)
+    generation_time_ms = Column(Integer, nullable=True)
+    ai_output_char_count = Column(Integer, nullable=True)
+    final_output_char_count = Column(Integer, nullable=True)
+    was_edited = Column(Integer, nullable=True)
+    edited_section_count = Column(Integer, nullable=True)
+    was_copied = Column(Integer, nullable=True)
+    feedback_rating = Column(String(16), nullable=True)
+    risk_level = Column(String(128), nullable=True)
+    field_fill_json = Column(Text, nullable=True)
+    interventions_count = Column(Integer, nullable=True)
 
 
 def _hash_password(password: str) -> str:
@@ -210,7 +269,6 @@ def hash_token(token: str) -> str:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "clarity_prototype.db"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "anthropic/claude-sonnet-4-5"
 OPENROUTER_AUDIO_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
@@ -587,58 +645,37 @@ scheduler = BackgroundScheduler()
 
 
 def purge_expired_session_data() -> None:
-    with get_connection() as connection:
-        # Archive analytics before purging
-        connection.execute(
-            """
-            INSERT INTO note_analytics (
-                purged_at, note_format, note_template_name, session_type,
-                duration_minutes, treatment_modality, diagnosis_count,
-                section_count, generation_time_ms, ai_output_char_count,
-                final_output_char_count, was_edited, was_copied, feedback_rating,
-                risk_level, interventions_count
-            )
-            SELECT
-                datetime('now'), note_format, note_template_name, session_type,
-                duration_minutes, treatment_modality,
-                CASE WHEN primary_diagnosis IS NOT NULL THEN 1 ELSE 0 END,
-                0, generation_time_ms, 0, 0,
-                CASE WHEN edits != '{}' THEN 1 ELSE 0 END,
-                CASE WHEN copied_at IS NOT NULL THEN 1 ELSE 0 END,
-                feedback_rating, NULL, 0
-            FROM note_generations
-            WHERE created_at < datetime('now', '-30 minutes')
-              AND input_payload != '{}'
-            """
-        )
-        # Purge PHI fields
-        connection.execute(
-            """
-            UPDATE note_generations
-            SET input_payload = '{}', ai_output = '{}',
-                client_name = '[purged]', primary_diagnosis = NULL,
-                final_output = NULL
-            WHERE created_at < datetime('now', '-30 minutes')
-              AND input_payload != '{}'
-            """
-        )
-        connection.commit()
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-        expired_sessions = (
-            db.query(ActiveSession).filter(ActiveSession.expires_at < now).all()
+        cutoff = now - timedelta(minutes=30)
+        expired_notes = (
+            db.query(NoteGeneration)
+            .filter(
+                NoteGeneration.created_at < cutoff,
+                NoteGeneration.input_payload != "{}",
+            )
+            .all()
         )
-        expired_user_ids = [s.user_id for s in expired_sessions]
-        db.query(ActiveSession).filter(ActiveSession.expires_at < now).delete()
+        for note in expired_notes:
+            input_payload = parse_json_field(decrypt_field(note.input_payload), default={})
+            if isinstance(input_payload, dict) and input_payload:
+                db.add(NoteAnalytic(**_extract_analytics_row(note, input_payload)))
+            note.input_payload = "{}"
+            note.ai_output = "{}"
+            note.client_name = "[purged]"
+            note.primary_diagnosis = None
+            note.final_output = None
+
+        expired_sessions = db.query(ActiveSession).filter(ActiveSession.expires_at < now).all()
+        expired_user_ids = list({session.user_id for session in expired_sessions})
         if expired_user_ids:
-            with get_connection() as conn:
-                placeholders = ",".join("?" * len(expired_user_ids))
-                conn.execute(
-                    f"UPDATE note_generations SET user_id = NULL WHERE user_id IN ({placeholders})",
-                    expired_user_ids,
-                )
-                conn.commit()
+            (
+                db.query(NoteGeneration)
+                .filter(NoteGeneration.user_id.in_(expired_user_ids))
+                .update({NoteGeneration.user_id: None}, synchronize_session=False)
+            )
+        db.query(ActiveSession).filter(ActiveSession.expires_at < now).delete(synchronize_session=False)
         db.commit()
     except Exception:
         db.rollback()
@@ -646,120 +683,32 @@ def purge_expired_session_data() -> None:
         db.close()
 
 
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
-    existing_columns = {
-        row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    }
-    if column_name not in existing_columns:
-        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-
-
-def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with get_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS note_generations (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              user_id TEXT,
-              client_name TEXT NOT NULL,
-              session_number INTEGER,
-              session_date TEXT,
-              duration_minutes INTEGER,
-              session_type TEXT,
-              note_format TEXT NOT NULL,
-              note_template_name TEXT,
-              section_config_json TEXT,
-              primary_diagnosis TEXT,
-              treatment_modality TEXT,
-              input_payload TEXT NOT NULL,
-              ai_output TEXT NOT NULL,
-              ai_model TEXT DEFAULT 'anthropic/claude-sonnet-4-5',
-              generation_time_ms INTEGER,
-              edits TEXT DEFAULT '{}',
-              final_output TEXT,
-              copied_at TIMESTAMP,
-              feedback_rating TEXT,
-              feedback_notes TEXT
-            );
-            """
-        )
-        ensure_column(connection, "note_generations", "user_id", "TEXT")
-        ensure_column(connection, "note_generations", "note_template_name", "TEXT")
-        ensure_column(connection, "note_generations", "section_config_json", "TEXT")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS templates (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id TEXT,
-              name TEXT NOT NULL,
-              sections_json TEXT NOT NULL,
-              is_builtin INTEGER NOT NULL DEFAULT 0,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS note_analytics (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              note_id INTEGER,
-              purged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              note_format TEXT,
-              note_template_name TEXT,
-              session_type TEXT,
-              duration_minutes INTEGER,
-              treatment_modality TEXT,
-              diagnosis_count INTEGER,
-              section_count INTEGER,
-              generation_time_ms INTEGER,
-              ai_output_char_count INTEGER,
-              final_output_char_count INTEGER,
-              was_edited INTEGER DEFAULT 0,
-              edited_section_count INTEGER DEFAULT 0,
-              was_copied INTEGER DEFAULT 0,
-              feedback_rating TEXT,
-              risk_level TEXT,
-              field_fill_json TEXT,
-              interventions_count INTEGER
-            );
-            """
-        )
-        seed_builtin_templates(connection)
-        connection.commit()
-
-
-def seed_builtin_templates(connection: sqlite3.Connection) -> None:
-    for template in BUILTIN_TEMPLATES:
-        existing = connection.execute(
-            "SELECT id FROM templates WHERE name = ? AND is_builtin = 1",
-            (template["name"],),
-        ).fetchone()
-        if existing is None:
-            connection.execute(
-                """
-                INSERT INTO templates (user_id, name, sections_json, is_builtin)
-                VALUES (?, ?, ?, 1)
-                """,
-                (
-                    None,
-                    template["name"],
-                    json.dumps(template["sections_json"]),
-                ),
-            )
+def seed_builtin_templates() -> None:
+    db = SessionLocal()
+    try:
+        for template in BUILTIN_TEMPLATES:
+            existing = db.query(NoteTemplate).filter_by(name=template["name"], is_builtin=1).first()
+            if existing is None:
+                db.add(
+                    NoteTemplate(
+                        user_id=None,
+                        name=template["name"],
+                        sections_json=json.dumps(template["sections_json"]),
+                        is_builtin=1,
+                    )
+                )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.on_event("startup")
 def startup_event() -> None:
-    init_db()
     _create_auth_tables()
+    seed_builtin_templates()
     scheduler.add_job(purge_expired_session_data, "interval", minutes=30, id="session_purge")
     scheduler.start()
 
@@ -1156,41 +1105,46 @@ def parse_json_field(value: str | None, default: Any) -> Any:
         return default
 
 
+def serialize_template(template: NoteTemplate) -> dict[str, Any]:
+    return {
+        "id": template.id,
+        "user_id": template.user_id,
+        "name": template.name,
+        "sections_json": normalize_template_sections(parse_json_field(template.sections_json, default=[])),
+        "is_builtin": bool(template.is_builtin),
+        "created_at": template.created_at,
+    }
+
+
 def get_template_for_user(
-    connection: sqlite3.Connection, user_id: str, template_id: int | None, template_name: str | None
+    db: Any, user_id: str, template_id: int | None, template_name: str | None
 ) -> dict[str, Any] | None:
-    row: sqlite3.Row | None = None
+    template: NoteTemplate | None = None
 
     if template_id:
-        row = connection.execute(
-            """
-            SELECT * FROM templates
-            WHERE id = ? AND (is_builtin = 1 OR user_id = ?)
-            """,
-            (template_id, user_id),
-        ).fetchone()
+        template = (
+            db.query(NoteTemplate)
+            .filter(
+                NoteTemplate.id == template_id,
+                (NoteTemplate.is_builtin == 1) | (NoteTemplate.user_id == user_id),
+            )
+            .first()
+        )
     elif template_name:
-        row = connection.execute(
-            """
-            SELECT * FROM templates
-            WHERE name = ? AND (is_builtin = 1 OR user_id = ?)
-            ORDER BY is_builtin DESC, id DESC
-            LIMIT 1
-            """,
-            (template_name, user_id),
-        ).fetchone()
+        template = (
+            db.query(NoteTemplate)
+            .filter(
+                NoteTemplate.name == template_name,
+                (NoteTemplate.is_builtin == 1) | (NoteTemplate.user_id == user_id),
+            )
+            .order_by(NoteTemplate.is_builtin.desc(), NoteTemplate.id.desc())
+            .first()
+        )
 
-    if row is None:
+    if template is None:
         return None
 
-    return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "name": row["name"],
-        "sections_json": normalize_template_sections(parse_json_field(row["sections_json"], default=[])),
-        "is_builtin": bool(row["is_builtin"]),
-        "created_at": row["created_at"],
-    }
+    return serialize_template(template)
 
 
 def resolve_section_config(
@@ -1431,17 +1385,15 @@ def build_plaintext_output(metadata: dict[str, Any], sections: list[dict[str, An
     return "\n".join(lines)
 
 
-def fetch_note_for_user(connection: sqlite3.Connection, note_id: int, user_id: str) -> sqlite3.Row:
-    row = connection.execute(
-        """
-        SELECT * FROM note_generations
-        WHERE id = ? AND user_id = ?
-        """,
-        (note_id, user_id),
-    ).fetchone()
-    if row is None:
+def fetch_note_for_user(db: Any, note_id: int, user_id: str) -> NoteGeneration:
+    note = (
+        db.query(NoteGeneration)
+        .filter(NoteGeneration.id == note_id, NoteGeneration.user_id == user_id)
+        .first()
+    )
+    if note is None:
         raise HTTPException(status_code=404, detail="Note not found.")
-    return row
+    return note
 
 
 def save_generated_note(
@@ -1452,45 +1404,33 @@ def save_generated_note(
     generation_time_ms: int,
     user_id: str,
 ) -> int:
-    with get_connection() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO note_generations (
-                user_id,
-                client_name,
-                session_number,
-                session_date,
-                duration_minutes,
-                session_type,
-                note_format,
-                note_template_name,
-                section_config_json,
-                primary_diagnosis,
-                treatment_modality,
-                input_payload,
-                ai_output,
-                generation_time_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                encrypt_field(payload.get("client_name")),
-                payload.get("session_number"),
-                payload.get("session_date"),
-                payload.get("duration_minutes"),
-                payload.get("session_type"),
-                note_format,
-                payload.get("note_template_name"),
-                json.dumps(section_config),
-                encrypt_field(serialize_diagnoses(payload.get("primary_diagnosis"))),
-                payload.get("treatment_modality"),
-                encrypt_field(json.dumps(payload)),
-                encrypt_field(json.dumps(sections)),
-                generation_time_ms,
-            ),
+    db = SessionLocal()
+    try:
+        note = NoteGeneration(
+            user_id=user_id,
+            client_name=encrypt_field(payload.get("client_name")),
+            session_number=payload.get("session_number"),
+            session_date=payload.get("session_date"),
+            duration_minutes=payload.get("duration_minutes"),
+            session_type=payload.get("session_type"),
+            note_format=note_format,
+            note_template_name=payload.get("note_template_name"),
+            section_config_json=json.dumps(section_config),
+            primary_diagnosis=encrypt_field(serialize_diagnoses(payload.get("primary_diagnosis"))),
+            treatment_modality=payload.get("treatment_modality"),
+            input_payload=encrypt_field(json.dumps(payload)),
+            ai_output=encrypt_field(json.dumps(sections)),
+            generation_time_ms=generation_time_ms,
         )
-        connection.commit()
-        return int(cursor.lastrowid)
+        db.add(note)
+        db.commit()
+        db.refresh(note)
+        return int(note.id)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 async def call_openrouter(
@@ -1693,28 +1633,17 @@ async def extract_session_fields(
 
 @app.get("/api/templates")
 def list_templates(user_id: str = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT * FROM templates
-            WHERE is_builtin = 1 OR user_id = ?
-            ORDER BY is_builtin DESC, created_at ASC, id ASC
-            """,
-            (user_id,),
-        ).fetchall()
-
-    templates = [
-        {
-            "id": row["id"],
-            "user_id": row["user_id"],
-            "name": row["name"],
-            "sections_json": normalize_template_sections(parse_json_field(row["sections_json"], default=[])),
-            "is_builtin": bool(row["is_builtin"]),
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
-    return {"templates": templates}
+    db = SessionLocal()
+    try:
+        templates = (
+            db.query(NoteTemplate)
+            .filter((NoteTemplate.is_builtin == 1) | (NoteTemplate.user_id == user_id))
+            .order_by(NoteTemplate.is_builtin.desc(), NoteTemplate.created_at.asc(), NoteTemplate.id.asc())
+            .all()
+        )
+        return {"templates": [serialize_template(template) for template in templates]}
+    finally:
+        db.close()
 
 
 @app.post("/api/templates")
@@ -1727,24 +1656,23 @@ def create_template(
 
     sections = normalize_template_sections(request.sections_json)
 
-    with get_connection() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO templates (user_id, name, sections_json, is_builtin)
-            VALUES (?, ?, ?, 0)
-            """,
-            (user_id, name, json.dumps(sections)),
+    db = SessionLocal()
+    try:
+        template = NoteTemplate(
+            user_id=user_id,
+            name=name,
+            sections_json=json.dumps(sections),
+            is_builtin=0,
         )
-        connection.commit()
-        template_id = int(cursor.lastrowid)
-
-    return {
-        "id": template_id,
-        "user_id": user_id,
-        "name": name,
-        "sections_json": sections,
-        "is_builtin": False,
-    }
+        db.add(template)
+        db.commit()
+        db.refresh(template)
+        return serialize_template(template)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.post("/api/transcribe-and-extract")
@@ -1775,53 +1703,54 @@ async def transcribe_and_extract(
 
 @app.get("/api/user/data")
 def get_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT * FROM note_generations
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            """,
-            (user_id,),
-        ).fetchall()
-
-    records = []
-    for row in rows:
-        input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
-        if isinstance(input_payload, dict):
-            input_payload["primary_diagnosis"] = normalize_diagnoses(input_payload.get("primary_diagnosis"))
-        records.append(
-            {
-                "id": row["id"],
-                "created_at": row["created_at"],
-                "user_id": row["user_id"],
-                "client_name": decrypt_field(row["client_name"]),
-                "session_number": row["session_number"],
-                "session_date": row["session_date"],
-                "duration_minutes": row["duration_minutes"],
-                "session_type": row["session_type"],
-                "note_format": row["note_format"],
-                "note_template_name": row["note_template_name"],
-                "primary_diagnosis": parse_stored_diagnoses(row["primary_diagnosis"]),
-                "treatment_modality": row["treatment_modality"],
-                "input_payload": input_payload,
-                "ai_output": parse_json_field(decrypt_field(row["ai_output"]), default={}),
-                "ai_model": row["ai_model"],
-                "generation_time_ms": row["generation_time_ms"],
-                "edits": parse_json_field(decrypt_field(row["edits"]), default={}),
-                "final_output": decrypt_field(row["final_output"]),
-                "copied_at": row["copied_at"],
-                "feedback_rating": row["feedback_rating"],
-                "feedback_notes": decrypt_field(row["feedback_notes"]),
-            }
+    db = SessionLocal()
+    try:
+        notes = (
+            db.query(NoteGeneration)
+            .filter(NoteGeneration.user_id == user_id)
+            .order_by(NoteGeneration.created_at.desc())
+            .all()
         )
 
-    return {
-        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "service": "Clarity by Bearing Digital",
-        "record_count": len(records),
-        "records": records,
-    }
+        records = []
+        for note in notes:
+            input_payload = parse_json_field(decrypt_field(note.input_payload), default={})
+            if isinstance(input_payload, dict):
+                input_payload["primary_diagnosis"] = normalize_diagnoses(input_payload.get("primary_diagnosis"))
+            records.append(
+                {
+                    "id": note.id,
+                    "created_at": note.created_at,
+                    "user_id": note.user_id,
+                    "client_name": decrypt_field(note.client_name),
+                    "session_number": note.session_number,
+                    "session_date": note.session_date,
+                    "duration_minutes": note.duration_minutes,
+                    "session_type": note.session_type,
+                    "note_format": note.note_format,
+                    "note_template_name": note.note_template_name,
+                    "primary_diagnosis": parse_stored_diagnoses(note.primary_diagnosis),
+                    "treatment_modality": note.treatment_modality,
+                    "input_payload": input_payload,
+                    "ai_output": parse_json_field(decrypt_field(note.ai_output), default={}),
+                    "ai_model": note.ai_model,
+                    "generation_time_ms": note.generation_time_ms,
+                    "edits": parse_json_field(decrypt_field(note.edits), default={}),
+                    "final_output": decrypt_field(note.final_output),
+                    "copied_at": note.copied_at,
+                    "feedback_rating": note.feedback_rating,
+                    "feedback_notes": decrypt_field(note.feedback_notes),
+                }
+            )
+
+        return {
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "service": "Clarity by Bearing Digital",
+            "record_count": len(records),
+            "records": records,
+        }
+    finally:
+        db.close()
 
 
 @app.put("/api/user/data/correct")
@@ -1837,56 +1766,49 @@ def correct_user_data(
             ),
         )
 
-    with get_connection() as connection:
-        fetch_note_for_user(connection, request.note_id, user_id)
-        if request.field == "primary_diagnosis":
-            next_value = encrypt_field(json.dumps([request.value.strip()]))
-        else:
-            next_value = encrypt_field(request.value.strip())
-
-        connection.execute(
-            f"UPDATE note_generations SET {request.field} = ?, user_id = COALESCE(user_id, ?) WHERE id = ?",  # noqa: S608
-            (next_value, user_id, request.note_id),
-        )
-        connection.commit()
-
-    return {"note_id": request.note_id, "field": request.field, "corrected": True}
-
-
-@app.delete("/api/user/data")
-def delete_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
-    with get_connection() as connection:
-        result = connection.execute(
-            """
-            SELECT COUNT(*) AS count FROM note_generations
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-        deleted_count = result["count"] if result else 0
-        # Anonymize note analytics rows before deleting note records
-        connection.execute(
-            "UPDATE note_generations SET user_id = NULL WHERE user_id = ?",
-            (user_id,),
-        )
-        connection.execute("DELETE FROM note_generations WHERE user_id IS NULL AND client_name = '[purged]'")
-        connection.execute("DELETE FROM templates WHERE user_id = ?", (user_id,))
-        connection.commit()
-
-    # Delete auth records from PostgreSQL/SQLite auth DB
     db = SessionLocal()
     try:
-        db.query(ActiveSession).filter(ActiveSession.user_id == user_id).delete()
-        db.query(SSOAccount).filter(SSOAccount.user_id == user_id).delete()
-        db.query(User).filter(User.id == user_id).delete()
+        note = fetch_note_for_user(db, request.note_id, user_id)
+        if request.field == "primary_diagnosis":
+            setattr(note, request.field, encrypt_field(json.dumps([request.value.strip()])))
+        else:
+            setattr(note, request.field, encrypt_field(request.value.strip()))
+        note.user_id = note.user_id or user_id
         db.commit()
+        return {"note_id": request.note_id, "field": request.field, "corrected": True}
     except Exception:
         db.rollback()
         raise
     finally:
         db.close()
 
-    return {"deleted": True, "records_deleted": deleted_count}
+
+@app.delete("/api/user/data")
+def delete_user_data(user_id: str = Depends(get_current_user)) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        deleted_count = db.query(NoteGeneration).filter(NoteGeneration.user_id == user_id).count()
+        (
+            db.query(NoteGeneration)
+            .filter(NoteGeneration.user_id == user_id)
+            .update({NoteGeneration.user_id: None}, synchronize_session=False)
+        )
+        (
+            db.query(NoteGeneration)
+            .filter(NoteGeneration.user_id.is_(None), NoteGeneration.client_name == "[purged]")
+            .delete(synchronize_session=False)
+        )
+        db.query(NoteTemplate).filter(NoteTemplate.user_id == user_id).delete(synchronize_session=False)
+        db.query(ActiveSession).filter(ActiveSession.user_id == user_id).delete(synchronize_session=False)
+        db.query(SSOAccount).filter(SSOAccount.user_id == user_id).delete(synchronize_session=False)
+        db.query(User).filter(User.id == user_id).delete(synchronize_session=False)
+        db.commit()
+        return {"deleted": True, "records_deleted": deleted_count}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.post("/api/generate-note")
@@ -1902,13 +1824,16 @@ async def generate_note(
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not configured.")
 
-    with get_connection() as connection:
+    db = SessionLocal()
+    try:
         template = get_template_for_user(
-            connection,
+            db,
             user_id,
             payload.get("note_template_id"),
             payload.get("note_template_name"),
         )
+    finally:
+        db.close()
 
     if template:
         payload["note_template_name"] = template["name"]
@@ -1934,55 +1859,55 @@ async def generate_note(
 def save_note_edits(
     note_id: int, request: EditRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    with get_connection() as connection:
-        row = fetch_note_for_user(connection, note_id, user_id)
-        section_config = resolve_section_config(row["note_format"], row["section_config_json"])
-        current_edits = parse_json_field(decrypt_field(row["edits"]), default={})
+    db = SessionLocal()
+    try:
+        note = fetch_note_for_user(db, note_id, user_id)
+        section_config = resolve_section_config(note.note_format, note.section_config_json)
+        current_edits = parse_json_field(decrypt_field(note.edits), default={})
         current_edits.update({key: value.strip() for key, value in request.edits.items() if value.strip()})
 
-        input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
+        input_payload = parse_json_field(decrypt_field(note.input_payload), default={})
         if isinstance(input_payload, dict):
             input_payload["primary_diagnosis"] = normalize_diagnoses(input_payload.get("primary_diagnosis"))
-            input_payload["note_template_name"] = row["note_template_name"]
+            input_payload["note_template_name"] = note.note_template_name
 
         final_output = build_plaintext_output(
             build_metadata(input_payload),
             build_section_state(
                 section_config,
-                parse_json_field(decrypt_field(row["ai_output"]), default={}),
+                parse_json_field(decrypt_field(note.ai_output), default={}),
                 current_edits,
             ),
         )
-        connection.execute(
-            """
-            UPDATE note_generations
-            SET edits = ?, final_output = ?, user_id = COALESCE(user_id, ?)
-            WHERE id = ?
-            """,
-            (encrypt_field(json.dumps(current_edits)), encrypt_field(final_output), user_id, note_id),
-        )
-        connection.commit()
-
-    return {"note_id": note_id, "edits": current_edits}
+        note.edits = encrypt_field(json.dumps(current_edits))
+        note.final_output = encrypt_field(final_output)
+        note.user_id = note.user_id or user_id
+        db.commit()
+        return {"note_id": note_id, "edits": current_edits}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.post("/api/notes/{note_id}/copied")
 def mark_note_copied(
     note_id: int, request: CopyRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    with get_connection() as connection:
-        fetch_note_for_user(connection, note_id, user_id)
-        connection.execute(
-            """
-            UPDATE note_generations
-            SET final_output = ?, copied_at = CURRENT_TIMESTAMP, user_id = COALESCE(user_id, ?)
-            WHERE id = ?
-            """,
-            (encrypt_field(request.final_output), user_id, note_id),
-        )
-        connection.commit()
-
-    return {"note_id": note_id, "copied": True}
+    db = SessionLocal()
+    try:
+        note = fetch_note_for_user(db, note_id, user_id)
+        note.final_output = encrypt_field(request.final_output)
+        note.copied_at = datetime.now(timezone.utc)
+        note.user_id = note.user_id or user_id
+        db.commit()
+        return {"note_id": note_id, "copied": True}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2009,34 +1934,34 @@ ANALYTICS_TRACKED_FIELDS = [
 ]
 
 
-def _extract_analytics_row(row: sqlite3.Row, input_payload: dict[str, Any]) -> dict[str, Any]:
+def _extract_analytics_row(note: NoteGeneration, input_payload: dict[str, Any]) -> dict[str, Any]:
     """Return an anonymized analytics dict suitable for inserting into note_analytics."""
     field_fill = {
         field: 1 if input_payload.get(field) else 0
         for field in ANALYTICS_TRACKED_FIELDS
     }
-    edits = parse_json_field(decrypt_field(row["edits"]), default={})
-    final_output = decrypt_field(row["final_output"])
-    ai_output_raw = decrypt_field(row["ai_output"])
+    edits = parse_json_field(decrypt_field(note.edits), default={})
+    final_output = decrypt_field(note.final_output)
+    ai_output_raw = decrypt_field(note.ai_output)
     diagnoses = normalize_diagnoses(input_payload.get("primary_diagnosis"))
     interventions_checked = input_payload.get("interventions_checked") or []
-    section_config = resolve_section_config(row["note_format"], row["section_config_json"])
+    section_config = resolve_section_config(note.note_format, note.section_config_json)
     return {
-        "note_id": row["id"],
-        "note_format": row["note_format"],
-        "note_template_name": row["note_template_name"],
-        "session_type": row["session_type"],
-        "duration_minutes": row["duration_minutes"],
-        "treatment_modality": row["treatment_modality"],
+        "note_id": note.id,
+        "note_format": note.note_format,
+        "note_template_name": note.note_template_name,
+        "session_type": note.session_type,
+        "duration_minutes": note.duration_minutes,
+        "treatment_modality": note.treatment_modality,
         "diagnosis_count": len(diagnoses),
         "section_count": len(section_config),
-        "generation_time_ms": row["generation_time_ms"],
+        "generation_time_ms": note.generation_time_ms,
         "ai_output_char_count": len(ai_output_raw) if ai_output_raw else 0,
         "final_output_char_count": len(final_output) if final_output else 0,
         "was_edited": 1 if edits else 0,
         "edited_section_count": len(edits) if isinstance(edits, dict) else 0,
-        "was_copied": 1 if row["copied_at"] else 0,
-        "feedback_rating": row["feedback_rating"],
+        "was_copied": 1 if note.copied_at else 0,
+        "feedback_rating": note.feedback_rating,
         "risk_level": input_payload.get("risk_level"),
         "field_fill_json": json.dumps(field_fill),
         "interventions_count": len(interventions_checked),
@@ -2045,156 +1970,125 @@ def _extract_analytics_row(row: sqlite3.Row, input_payload: dict[str, Any]) -> d
 
 @app.delete("/api/notes/{note_id}/purge")
 def purge_note_session(note_id: int, user_id: str = Depends(get_current_user)) -> dict[str, Any]:
-    with get_connection() as connection:
-        row = fetch_note_for_user(connection, note_id, user_id)
-        # Capture anonymized analytics before wiping PHI
-        input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
+    db = SessionLocal()
+    try:
+        note = fetch_note_for_user(db, note_id, user_id)
+        input_payload = parse_json_field(decrypt_field(note.input_payload), default={})
         if isinstance(input_payload, dict) and input_payload:
-            analytics = _extract_analytics_row(row, input_payload)
-            connection.execute(
-                """
-                INSERT INTO note_analytics (
-                    note_id, note_format, note_template_name, session_type,
-                    duration_minutes, treatment_modality, diagnosis_count,
-                    section_count, generation_time_ms, ai_output_char_count,
-                    final_output_char_count, was_edited, edited_section_count,
-                    was_copied, feedback_rating, risk_level, field_fill_json,
-                    interventions_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    analytics["note_id"],
-                    analytics["note_format"],
-                    analytics["note_template_name"],
-                    analytics["session_type"],
-                    analytics["duration_minutes"],
-                    analytics["treatment_modality"],
-                    analytics["diagnosis_count"],
-                    analytics["section_count"],
-                    analytics["generation_time_ms"],
-                    analytics["ai_output_char_count"],
-                    analytics["final_output_char_count"],
-                    analytics["was_edited"],
-                    analytics["edited_section_count"],
-                    analytics["was_copied"],
-                    analytics["feedback_rating"],
-                    analytics["risk_level"],
-                    analytics["field_fill_json"],
-                    analytics["interventions_count"],
-                ),
-            )
-        connection.execute(
-            """
-            UPDATE note_generations
-            SET input_payload = '{}', ai_output = '{}',
-                client_name = '[purged]', primary_diagnosis = NULL,
-                final_output = NULL, user_id = COALESCE(user_id, ?)
-            WHERE id = ?
-            """,
-            (user_id, note_id),
-        )
-        connection.commit()
-
-    return {"note_id": note_id, "purged": True}
+            db.add(NoteAnalytic(**_extract_analytics_row(note, input_payload)))
+        note.input_payload = "{}"
+        note.ai_output = "{}"
+        note.client_name = "[purged]"
+        note.primary_diagnosis = None
+        note.final_output = None
+        note.user_id = note.user_id or user_id
+        db.commit()
+        return {"note_id": note_id, "purged": True}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.post("/api/notes/{note_id}/feedback")
 def save_feedback(
     note_id: int, request: FeedbackRequest, user_id: str = Depends(get_current_user)
 ) -> dict[str, Any]:
-    with get_connection() as connection:
-        fetch_note_for_user(connection, note_id, user_id)
-        connection.execute(
-            """
-            UPDATE note_generations
-            SET feedback_rating = ?, feedback_notes = ?, user_id = COALESCE(user_id, ?)
-            WHERE id = ?
-            """,
-            (request.feedback_rating, encrypt_field(request.feedback_notes.strip()), user_id, note_id),
-        )
-        connection.commit()
-
-    return {"note_id": note_id, "feedback_rating": request.feedback_rating}
+    db = SessionLocal()
+    try:
+        note = fetch_note_for_user(db, note_id, user_id)
+        note.feedback_rating = request.feedback_rating
+        note.feedback_notes = encrypt_field(request.feedback_notes.strip())
+        note.user_id = note.user_id or user_id
+        db.commit()
+        return {"note_id": note_id, "feedback_rating": request.feedback_rating}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @app.get("/api/notes")
 def list_notes(user_id: str = Depends(get_current_user)) -> dict[str, list[dict[str, Any]]]:
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT id, created_at, user_id, client_name, session_number, session_date, duration_minutes,
-                   session_type, note_format, note_template_name, primary_diagnosis, treatment_modality,
-                   generation_time_ms, copied_at, feedback_rating, edits
-            FROM note_generations
-            WHERE user_id = ?
-            ORDER BY created_at DESC, id DESC
-            """,
-            (user_id,),
-        ).fetchall()
-
-    notes = []
-    for row in rows:
-        edits = parse_json_field(decrypt_field(row["edits"]), default={})
-        notes.append(
-            {
-                "id": row["id"],
-                "created_at": row["created_at"],
-                "user_id": row["user_id"],
-                "client_name": decrypt_field(row["client_name"]),
-                "session_number": row["session_number"],
-                "session_date": row["session_date"],
-                "duration_minutes": row["duration_minutes"],
-                "session_type": row["session_type"],
-                "note_format": row["note_format"],
-                "note_template_name": row["note_template_name"],
-                "primary_diagnosis": parse_stored_diagnoses(row["primary_diagnosis"]),
-                "treatment_modality": row["treatment_modality"],
-                "generation_time_ms": row["generation_time_ms"],
-                "copied_at": row["copied_at"],
-                "feedback_rating": row["feedback_rating"],
-                "edited_section_count": len(edits),
-            }
+    db = SessionLocal()
+    try:
+        note_rows = (
+            db.query(NoteGeneration)
+            .filter(NoteGeneration.user_id == user_id)
+            .order_by(NoteGeneration.created_at.desc(), NoteGeneration.id.desc())
+            .all()
         )
 
-    return {"notes": notes}
+        notes = []
+        for note in note_rows:
+            edits = parse_json_field(decrypt_field(note.edits), default={})
+            notes.append(
+                {
+                    "id": note.id,
+                    "created_at": note.created_at,
+                    "user_id": note.user_id,
+                    "client_name": decrypt_field(note.client_name),
+                    "session_number": note.session_number,
+                    "session_date": note.session_date,
+                    "duration_minutes": note.duration_minutes,
+                    "session_type": note.session_type,
+                    "note_format": note.note_format,
+                    "note_template_name": note.note_template_name,
+                    "primary_diagnosis": parse_stored_diagnoses(note.primary_diagnosis),
+                    "treatment_modality": note.treatment_modality,
+                    "generation_time_ms": note.generation_time_ms,
+                    "copied_at": note.copied_at,
+                    "feedback_rating": note.feedback_rating,
+                    "edited_section_count": len(edits),
+                }
+            )
+
+        return {"notes": notes}
+    finally:
+        db.close()
 
 
 @app.get("/api/notes/{note_id}")
 def get_note(note_id: int, user_id: str = Depends(get_current_user)) -> dict[str, Any]:
-    with get_connection() as connection:
-        row = fetch_note_for_user(connection, note_id, user_id)
+    db = SessionLocal()
+    try:
+        note = fetch_note_for_user(db, note_id, user_id)
 
-    input_payload = parse_json_field(decrypt_field(row["input_payload"]), default={})
-    if isinstance(input_payload, dict):
-        input_payload["primary_diagnosis"] = normalize_diagnoses(input_payload.get("primary_diagnosis"))
-        input_payload["note_template_name"] = row["note_template_name"]
-    ai_output = parse_json_field(decrypt_field(row["ai_output"]), default={})
-    edits = parse_json_field(decrypt_field(row["edits"]), default={})
-    section_config = resolve_section_config(row["note_format"], row["section_config_json"])
-    metadata = build_metadata(input_payload)
-    sections = build_section_state(section_config, ai_output, edits)
-    final_output = decrypt_field(row["final_output"])
+        input_payload = parse_json_field(decrypt_field(note.input_payload), default={})
+        if isinstance(input_payload, dict):
+            input_payload["primary_diagnosis"] = normalize_diagnoses(input_payload.get("primary_diagnosis"))
+            input_payload["note_template_name"] = note.note_template_name
+        ai_output = parse_json_field(decrypt_field(note.ai_output), default={})
+        edits = parse_json_field(decrypt_field(note.edits), default={})
+        section_config = resolve_section_config(note.note_format, note.section_config_json)
+        metadata = build_metadata(input_payload)
+        sections = build_section_state(section_config, ai_output, edits)
+        final_output = decrypt_field(note.final_output)
 
-    return {
-        "id": row["id"],
-        "created_at": row["created_at"],
-        "format": row["note_format"],
-        "template_name": row["note_template_name"],
-        "metadata": metadata,
-        "input_payload": input_payload,
-        "sections": sections,
-        "analysis": {
-            "ai_model": row["ai_model"],
-            "generation_time_ms": row["generation_time_ms"],
-            "edited_sections": sorted(edits.keys()),
-            "edited_section_count": len(edits),
-            "copied": bool(row["copied_at"]),
-            "copied_at": row["copied_at"],
-            "feedback_rating": row["feedback_rating"],
-            "feedback_notes": decrypt_field(row["feedback_notes"]),
-        },
-        "final_output": final_output or build_plaintext_output(metadata, sections),
-    }
+        return {
+            "id": note.id,
+            "created_at": note.created_at,
+            "format": note.note_format,
+            "template_name": note.note_template_name,
+            "metadata": metadata,
+            "input_payload": input_payload,
+            "sections": sections,
+            "analysis": {
+                "ai_model": note.ai_model,
+                "generation_time_ms": note.generation_time_ms,
+                "edited_sections": sorted(edits.keys()),
+                "edited_section_count": len(edits),
+                "copied": bool(note.copied_at),
+                "copied_at": note.copied_at,
+                "feedback_rating": note.feedback_rating,
+                "feedback_notes": decrypt_field(note.feedback_notes),
+            },
+            "final_output": final_output or build_plaintext_output(metadata, sections),
+        }
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2204,93 +2098,100 @@ def get_note(note_id: int, user_id: str = Depends(get_current_user)) -> dict[str
 @app.get("/api/analytics/summary")
 def get_analytics_summary() -> dict[str, Any]:
     """Aggregate anonymized stats from note_analytics. No PHI. No auth required."""
-    with get_connection() as connection:
-        total = connection.execute("SELECT COUNT(*) FROM note_analytics").fetchone()[0]
+    db = SessionLocal()
+    try:
+        total = db.execute(text("SELECT COUNT(*) FROM note_analytics")).scalar() or 0
 
         by_format = {
             (row[0] or "unknown"): row[1]
-            for row in connection.execute(
-                "SELECT note_format, COUNT(*) FROM note_analytics GROUP BY note_format"
-            ).fetchall()
+            for row in db.execute(
+                text("SELECT note_format, COUNT(*) FROM note_analytics GROUP BY note_format")
+            ).all()
         }
         by_template = {
             (row[0] or "standard"): row[1]
-            for row in connection.execute(
-                "SELECT note_template_name, COUNT(*) FROM note_analytics GROUP BY note_template_name"
-            ).fetchall()
+            for row in db.execute(
+                text("SELECT note_template_name, COUNT(*) FROM note_analytics GROUP BY note_template_name")
+            ).all()
         }
 
-        avgs = connection.execute(
-            """
-            SELECT
-                AVG(generation_time_ms),
-                AVG(ai_output_char_count),
-                AVG(final_output_char_count),
-                AVG(was_copied) * 100.0,
-                AVG(was_edited) * 100.0,
-                AVG(edited_section_count),
-                AVG(diagnosis_count),
-                AVG(interventions_count)
-            FROM note_analytics
-            """
-        ).fetchone()
+        avgs = db.execute(
+            text(
+                """
+                SELECT
+                    AVG(generation_time_ms),
+                    AVG(ai_output_char_count),
+                    AVG(final_output_char_count),
+                    AVG(was_copied) * 100.0,
+                    AVG(was_edited) * 100.0,
+                    AVG(edited_section_count),
+                    AVG(diagnosis_count),
+                    AVG(interventions_count)
+                FROM note_analytics
+                """
+            )
+        ).first()
 
         def top3(col: str) -> list[dict[str, Any]]:
-            rows = connection.execute(
-                f"SELECT {col}, COUNT(*) as n FROM note_analytics "
-                f"WHERE {col} IS NOT NULL GROUP BY {col} ORDER BY n DESC LIMIT 3"
-            ).fetchall()
-            return [{"value": r[0], "count": r[1]} for r in rows]
+            rows = db.execute(
+                text(
+                    f"SELECT {col}, COUNT(*) AS n FROM note_analytics "
+                    f"WHERE {col} IS NOT NULL GROUP BY {col} ORDER BY n DESC LIMIT 3"
+                )
+            ).all()
+            return [{"value": row[0], "count": row[1]} for row in rows]
 
         risk_dist = {
             (row[0] or "not_specified"): row[1]
-            for row in connection.execute(
-                "SELECT risk_level, COUNT(*) FROM note_analytics GROUP BY risk_level"
-            ).fetchall()
+            for row in db.execute(
+                text("SELECT risk_level, COUNT(*) FROM note_analytics GROUP BY risk_level")
+            ).all()
         }
 
-        fill_rows = connection.execute(
-            "SELECT field_fill_json FROM note_analytics WHERE field_fill_json IS NOT NULL"
-        ).fetchall()
+        fill_rows = db.execute(
+            text("SELECT field_fill_json FROM note_analytics WHERE field_fill_json IS NOT NULL")
+        ).all()
         field_fill_rates: dict[str, float] = {}
         if fill_rows:
             totals: dict[str, int] = {}
             counts: dict[str, int] = {}
-            for (fjson,) in fill_rows:
+            for (field_fill_json,) in fill_rows:
                 try:
-                    fdata = json.loads(fjson)
-                    for k, v in fdata.items():
-                        totals[k] = totals.get(k, 0) + int(v)
-                        counts[k] = counts.get(k, 0) + 1
+                    field_data = json.loads(field_fill_json)
+                    for key, value in field_data.items():
+                        totals[key] = totals.get(key, 0) + int(value)
+                        counts[key] = counts.get(key, 0) + 1
                 except Exception:
                     pass
             field_fill_rates = {
-                k: round(totals[k] / counts[k] * 100, 1)
-                for k in totals
-                if counts[k] > 0
+                key: round(totals[key] / counts[key] * 100, 1)
+                for key in totals
+                if counts[key] > 0
             }
 
-    def r1(v: Any) -> Any:
-        return round(v, 1) if v is not None else None
+        def r1(value: Any) -> Any:
+            return round(value, 1) if value is not None else None
 
-    return {
-        "total_notes_purged": total,
-        "by_format": by_format,
-        "by_template": by_template,
-        "avg_generation_time_ms": r1(avgs[0]) if avgs else None,
-        "avg_ai_output_chars": r1(avgs[1]) if avgs else None,
-        "avg_final_output_chars": r1(avgs[2]) if avgs else None,
-        "copy_rate_pct": r1(avgs[3]) if avgs else None,
-        "edit_rate_pct": r1(avgs[4]) if avgs else None,
-        "avg_edited_sections": r1(avgs[5]) if avgs else None,
-        "avg_diagnosis_count": r1(avgs[6]) if avgs else None,
-        "avg_interventions_count": r1(avgs[7]) if avgs else None,
-        "top_session_types": top3("session_type"),
-        "top_treatment_modalities": top3("treatment_modality"),
-        "top_durations": top3("duration_minutes"),
-        "risk_level_distribution": risk_dist,
-        "field_fill_rates_pct": field_fill_rates,
-    }
+        return {
+            "total_notes_purged": int(total),
+            "by_format": by_format,
+            "by_template": by_template,
+            "avg_generation_time_ms": r1(avgs[0]) if avgs else None,
+            "avg_ai_output_chars": r1(avgs[1]) if avgs else None,
+            "avg_final_output_chars": r1(avgs[2]) if avgs else None,
+            "copy_rate_pct": r1(avgs[3]) if avgs else None,
+            "edit_rate_pct": r1(avgs[4]) if avgs else None,
+            "avg_edited_sections": r1(avgs[5]) if avgs else None,
+            "avg_diagnosis_count": r1(avgs[6]) if avgs else None,
+            "avg_interventions_count": r1(avgs[7]) if avgs else None,
+            "top_session_types": top3("session_type"),
+            "top_treatment_modalities": top3("treatment_modality"),
+            "top_durations": top3("duration_minutes"),
+            "risk_level_distribution": risk_dist,
+            "field_fill_rates_pct": field_fill_rates,
+        }
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
